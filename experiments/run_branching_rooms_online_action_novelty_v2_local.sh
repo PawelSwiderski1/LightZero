@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT_DIR"
+
+export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib-lightzero}
+export PYTHONUNBUFFERED=1
+
+exec .venv/bin/python -u experiments/run_branching_rooms_online_action_novelty.py \
+  --offline-run .local_runs/branching_rooms_action_novelty_seed0 \
+  --output-dir .local_runs/branching_rooms_online_action_novelty_v2_seed0 \
+  --conditions random frozen_predictor frozen_topk online_prioritized_topk \
+  --device cpu \
+  "$@"

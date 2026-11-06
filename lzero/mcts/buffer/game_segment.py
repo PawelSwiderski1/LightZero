@@ -1,10 +1,25 @@
 import copy
-from typing import List, Tuple, Optional
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from easydict import EasyDict
 
 from ding.utils.compression_helper import jpeg_data_decompressor
+
+
+def should_bootstrap_at_trajectory_boundary(
+        bootstrap_index: int,
+        trajectory_length: int,
+        time_limit_truncated: bool,
+        bootstrap_at_time_limit: bool,
+) -> bool:
+    if bootstrap_index < trajectory_length:
+        return True
+    return bool(
+        bootstrap_at_time_limit
+        and time_limit_truncated
+        and bootstrap_index == trajectory_length
+    )
 
 
 class GameSegment:
@@ -77,9 +92,17 @@ class GameSegment:
         self.obs_segment = []
         self.action_segment = []
         self.reward_segment = []
+        self.intrinsic_reward_segment = []
+        self.intrinsic_reward_raw_segment = []
+        self.environment_state_segment = []
+        self.environment_initial_state = None
 
         self.child_visit_segment = []
         self.root_value_segment = []
+        self.pred_value_segment = []
+        self.root_action_diagnostics_segment = []
+        self.main_tree_trace_segment = []
+        self.intrinsic_tree_trace_segment = []
 
         self.action_mask_segment = []
         self.to_play_segment = []
@@ -91,12 +114,30 @@ class GameSegment:
 
         self.improved_policy_probs = []
 
+        self.done = False
+        self.time_limit_truncated = False
+        self.reached_goal = False
+        self.episode_return = None
+        self.pure_exploration_episode = False
+
         if self.sampled_algo:
             self.root_sampled_actions = []
         if self.use_ture_chance_label_in_chance_encoder:
             self.chance_segment = []
 
         self.reanalyze_time = 0
+
+    def set_terminal_metadata(
+            self,
+            done: bool = False,
+            time_limit_truncated: bool = False,
+            reached_goal: bool = False,
+            episode_return: Optional[float] = None,
+    ) -> None:
+        self.done = bool(done)
+        self.time_limit_truncated = bool(time_limit_truncated)
+        self.reached_goal = bool(reached_goal)
+        self.episode_return = None if episode_return is None else float(episode_return)
 
     def get_unroll_obs(self, timestep: int, num_unroll_steps: int = 0, padding: bool = False) -> np.ndarray:
         """
@@ -153,6 +194,9 @@ class GameSegment:
             to_play: int = -1,
             timestep: int = 0,
             chance: int = 0,
+            intrinsic_reward: float = 0.0,
+            intrinsic_reward_raw: float = 0.0,
+            environment_state: Optional[Sequence[int]] = None,
     ) -> None:
         """
         Overview:
@@ -161,6 +205,12 @@ class GameSegment:
         self.action_segment.append(action)
         self.obs_segment.append(obs)
         self.reward_segment.append(reward)
+        self.intrinsic_reward_segment.append(float(intrinsic_reward))
+        self.intrinsic_reward_raw_segment.append(float(intrinsic_reward_raw))
+        if environment_state is not None:
+            self.environment_state_segment.append(
+                tuple(int(value) for value in environment_state)
+            )
 
         self.action_mask_segment.append(action_mask)
         self.to_play_segment.append(to_play)
@@ -172,6 +222,12 @@ class GameSegment:
     def pad_over(
             self, next_segment_observations: List, next_segment_rewards: List, next_segment_actions: List, next_segment_root_values: List,
             next_segment_child_visits: List, next_segment_improved_policy: List = None, next_chances: List = None,
+            next_segment_intrinsic_rewards: List = None,
+            next_segment_intrinsic_reward_raws: List = None,
+            next_segment_pred_values: List = None,
+            next_segment_action_masks: List = None,
+            next_segment_to_plays: List = None,
+            next_segment_timesteps: List = None,
     ) -> None:
         """
         Overview:
@@ -204,11 +260,64 @@ class GameSegment:
         for reward in next_segment_rewards:
             self.reward_segment.append(reward)
 
+        if next_segment_intrinsic_rewards is None:
+            next_segment_intrinsic_rewards = [0.0 for _ in next_segment_rewards]
+        next_segment_intrinsic_rewards = list(next_segment_intrinsic_rewards)
+        next_segment_intrinsic_rewards += [
+            0.0 for _ in range(len(next_segment_rewards) - len(next_segment_intrinsic_rewards))
+        ]
+        next_segment_intrinsic_rewards = next_segment_intrinsic_rewards[:len(next_segment_rewards)]
+        for intrinsic_reward in next_segment_intrinsic_rewards:
+            self.intrinsic_reward_segment.append(float(intrinsic_reward))
+        if next_segment_intrinsic_reward_raws is None:
+            next_segment_intrinsic_reward_raws = [0.0 for _ in next_segment_rewards]
+        next_segment_intrinsic_reward_raws = list(next_segment_intrinsic_reward_raws)
+        next_segment_intrinsic_reward_raws += [
+            0.0 for _ in range(len(next_segment_rewards) - len(next_segment_intrinsic_reward_raws))
+        ]
+        next_segment_intrinsic_reward_raws = next_segment_intrinsic_reward_raws[:len(next_segment_rewards)]
+        for intrinsic_reward_raw in next_segment_intrinsic_reward_raws:
+            self.intrinsic_reward_raw_segment.append(float(intrinsic_reward_raw))
+
         for action in next_segment_actions:
             self.action_segment.append(action)
 
+        padding_length = len(next_segment_actions)
+        if next_segment_action_masks is None:
+            next_segment_action_masks = [
+                np.ones(self.action_space_size, dtype=np.int8)
+                for _ in range(padding_length)
+            ]
+        if next_segment_to_plays is None:
+            next_segment_to_plays = [-1 for _ in range(padding_length)]
+        if next_segment_timesteps is None:
+            next_segment_timesteps = [0 for _ in range(padding_length)]
+        next_segment_action_masks = list(next_segment_action_masks)
+        next_segment_to_plays = list(next_segment_to_plays)
+        next_segment_timesteps = list(next_segment_timesteps)
+        if min(
+                len(next_segment_action_masks),
+                len(next_segment_to_plays),
+                len(next_segment_timesteps),
+        ) < padding_length:
+            raise ValueError(
+                'Segment padding metadata must contain one action mask, to-play '
+                'value, and timestep per padded action.'
+            )
+        for action_mask in next_segment_action_masks[:padding_length]:
+            self.action_mask_segment.append(copy.deepcopy(action_mask))
+        for to_play in next_segment_to_plays[:padding_length]:
+            self.to_play_segment.append(copy.deepcopy(to_play))
+        for timestep in next_segment_timesteps[:padding_length]:
+            self.timestep_segment.append(copy.deepcopy(timestep))
+
         for value in next_segment_root_values:
             self.root_value_segment.append(value)
+
+        if next_segment_pred_values is None:
+            next_segment_pred_values = next_segment_root_values
+        for value in next_segment_pred_values:
+            self.pred_value_segment.append(value)
 
         for child_visits in next_segment_child_visits:
             self.child_visit_segment.append(child_visits)
@@ -228,7 +337,13 @@ class GameSegment:
         return self.target_values[timestep], self.target_rewards[timestep], self.target_policies[timestep]
 
     def store_search_stats(
-            self, visit_counts: List, root_value: List, root_sampled_actions: List = None, improved_policy: List = None, idx: int = None
+            self,
+            visit_counts: List,
+            root_value: List,
+            root_sampled_actions: List = None,
+            improved_policy: List = None,
+            idx: int = None,
+            pred_value: List = None,
     ) -> None:
         """
         Overview:
@@ -241,6 +356,7 @@ class GameSegment:
         if idx is None:
             self.child_visit_segment.append([visit_count / sum_visits for visit_count in visit_counts])
             self.root_value_segment.append(root_value)
+            self.pred_value_segment.append(root_value if pred_value is None else pred_value)
             if self.sampled_algo:
                 self.root_sampled_actions.append(root_sampled_actions)
             # store the improved policy in Gumbel MuZero: \pi'=softmax(logits + \sigma(CompletedQ))
@@ -249,7 +365,21 @@ class GameSegment:
         else:
             self.child_visit_segment[idx] = [visit_count / sum_visits for visit_count in visit_counts]
             self.root_value_segment[idx] = root_value
+            if isinstance(self.pred_value_segment, np.ndarray):
+                self.pred_value_segment = self.pred_value_segment.tolist()
+            while len(self.pred_value_segment) <= idx:
+                self.pred_value_segment.append(root_value)
+            self.pred_value_segment[idx] = root_value if pred_value is None else pred_value
             self.improved_policy_probs[idx] = improved_policy
+
+    def store_root_action_diagnostics(self, root_action_diagnostics: List) -> None:
+        self.root_action_diagnostics_segment.append(root_action_diagnostics)
+
+    def store_main_tree_trace(self, main_tree_trace: Optional[dict]) -> None:
+        self.main_tree_trace_segment.append(main_tree_trace)
+
+    def store_intrinsic_tree_trace(self, intrinsic_tree_trace: Optional[dict]) -> None:
+        self.intrinsic_tree_trace_segment.append(intrinsic_tree_trace)
 
     def game_segment_to_array(self) -> None:
         """
@@ -285,6 +415,7 @@ class GameSegment:
             - self.obs_segment (:obj:`numpy.ndarray`): A numpy array version of the original obs_segment.
             - self.action_segment (:obj:`numpy.ndarray`): A numpy array version of the original action_segment.
             - self.reward_segment (:obj:`numpy.ndarray`): A numpy array version of the original reward_segment.
+            - self.intrinsic_reward_segment (:obj:`numpy.ndarray`): A numpy array version of selected intrinsic rewards.
             - self.child_visit_segment (:obj:`numpy.ndarray`): A numpy array version of the original child_visit_segment.
             - self.root_value_segment (:obj:`numpy.ndarray`): A numpy array version of the original root_value_segment.
             - self.improved_policy_probs (:obj:`numpy.ndarray`): A numpy array version of the original improved_policy_probs.
@@ -300,6 +431,11 @@ class GameSegment:
         self.obs_segment = np.array(self.obs_segment)
         self.action_segment = np.array(self.action_segment)
         self.reward_segment = np.array(self.reward_segment)
+        self.intrinsic_reward_segment = np.array(self.intrinsic_reward_segment, dtype=np.float32)
+        self.intrinsic_reward_raw_segment = np.array(self.intrinsic_reward_raw_segment, dtype=np.float32)
+        self.environment_state_segment = np.asarray(
+            self.environment_state_segment, dtype=np.int32
+        )
 
         # Check if all elements in self.child_visit_segment have the same length
         if all(len(x) == len(self.child_visit_segment[0]) for x in self.child_visit_segment):
@@ -311,6 +447,7 @@ class GameSegment:
             self.child_visit_segment = np.array(self.child_visit_segment, dtype=object)
 
         self.root_value_segment = np.array(self.root_value_segment)
+        self.pred_value_segment = np.array(self.pred_value_segment)
         self.improved_policy_probs = np.array(self.improved_policy_probs)
 
         self.action_mask_segment = np.array(self.action_mask_segment)
@@ -331,9 +468,18 @@ class GameSegment:
         self.obs_segment = []
         self.action_segment = []
         self.reward_segment = []
+        self.intrinsic_reward_segment = []
+        self.intrinsic_reward_raw_segment = []
+        self.environment_state_segment = []
+        self.environment_initial_state = None
 
         self.child_visit_segment = []
         self.root_value_segment = []
+        self.pred_value_segment = []
+        self.root_action_diagnostics_segment = []
+        self.main_tree_trace_segment = []
+        self.intrinsic_tree_trace_segment = []
+        self.pure_exploration_episode = False
 
         self.action_mask_segment = []
         self.to_play_segment = []
@@ -361,4 +507,3 @@ class GameSegment:
 
     def __len__(self):
         return len(self.action_segment)
-

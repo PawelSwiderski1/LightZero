@@ -39,8 +39,11 @@ def eval_muzero(
         - policy (:obj:`Policy`): Converged policy.
     """
     cfg, create_cfg = input_cfg
-    assert create_cfg.policy.type in ['efficientzero', 'muzero', 'muzero_context', 'muzero_rnn_full_obs', 'stochastic_muzero', 'gumbel_muzero', 'sampled_efficientzero', 'unizero'], \
-        "LightZero now only support the following algo.: 'efficientzero', 'muzero', 'muzero_context', 'muzero_rnn_full_obs', 'stochastic_muzero', 'gumbel_muzero', 'sampled_efficientzero', 'unizero'"
+    assert create_cfg.policy.type in [
+        'efficientzero', 'muzero', 'muzero_context', 'muzero_rnn_full_obs', 'stochastic_muzero',
+        'gumbel_muzero', 'sampled_efficientzero', 'unizero', 'ensemble_muzero'
+    ], \
+        "LightZero now only support the following algo.: 'efficientzero', 'muzero', 'muzero_context', 'muzero_rnn_full_obs', 'stochastic_muzero', 'gumbel_muzero', 'sampled_efficientzero', 'unizero', 'ensemble_muzero'"
 
     if cfg.policy.cuda and torch.cuda.is_available():
         cfg.policy.device = 'cuda'
@@ -51,6 +54,8 @@ def eval_muzero(
     # Create main components: env, policy
     env_fn, collector_env_cfg, evaluator_env_cfg = get_vec_env_setting(cfg.env)
     evaluator_env = create_env_manager(cfg.env.manager, [partial(env_fn, cfg=c) for c in evaluator_env_cfg])
+    if cfg.env.get('replay_path', None):
+        evaluator_env.enable_save_replay(cfg.env.replay_path)
     # print(f"cfg.seed:{cfg.seed}")
     evaluator_env.seed(cfg.seed, dynamic_seed=False)
     set_pkg_seed(cfg.seed, use_cuda=cfg.policy.cuda)
@@ -106,4 +111,5 @@ def eval_muzero(
                 )
             print("=" * 20)
 
+        evaluator.close()
         return returns.mean(), returns

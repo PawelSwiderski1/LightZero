@@ -20,6 +20,12 @@ class MuZeroModelMLP(nn.Module):
         reward_head_hidden_channels: SequenceType = [32],
         value_head_hidden_channels: SequenceType = [32],
         policy_head_hidden_channels: SequenceType = [32],
+        intrinsic_reward_head_hidden_channels: SequenceType = [32],
+        intrinsic_value_head_hidden_channels: SequenceType = [32],
+        intrinsic_reward_target_transform: str = 'raw',
+        intrinsic_reward_log_reference: float = 1e-2,
+        intrinsic_reward_log_epsilon: float = 1e-8,
+        intrinsic_reward_log_max_raw: float = 5.0,
         reward_support_range: SequenceType =(-300., 301., 1.),
         value_support_range: SequenceType =(-300., 301., 1.),
         proj_hid: int = 1024,
@@ -30,9 +36,12 @@ class MuZeroModelMLP(nn.Module):
         categorical_distribution: bool = True,
         activation: Optional[nn.Module] = nn.ReLU(inplace=True),
         last_linear_layer_init_zero: bool = True,
+        value_last_linear_layer_init_zero: Optional[bool] = None,
         state_norm: bool = False,
+        representation_last_linear_layer_init_zero: Optional[bool] = None,
         discrete_action_encoding_type: str = 'one_hot',
         norm_type: Optional[str] = 'BN',
+        ssl_norm_type: Optional[str] = None,
         res_connection_in_dynamics: bool = False,
         *args,
         **kwargs
@@ -51,6 +60,10 @@ class MuZeroModelMLP(nn.Module):
             - reward_head_hidden_channels (:obj:`SequenceType`): The number of hidden layers of the reward head (MLP head).
             - value_head_hidden_channels (:obj:`SequenceType`): The number of hidden layers used in value head (MLP head).
             - policy_head_hidden_channels (:obj:`SequenceType`): The number of hidden layers used in policy head (MLP head).
+            - intrinsic_reward_head_hidden_channels (:obj:`SequenceType`): The number of hidden layers used in the
+                scalar intrinsic reward head.
+            - intrinsic_value_head_hidden_channels (:obj:`SequenceType`): The number of hidden layers used in the
+                scalar intrinsic value head.
             - reward_support_range (:obj:`SequenceType`): The range of categorical reward output
             - value_support_range (:obj:`SequenceType`): The range of categorical value output.
             - proj_hid (:obj:`int`): The size of projection hidden layer.
@@ -62,9 +75,15 @@ class MuZeroModelMLP(nn.Module):
             - activation (:obj:`Optional[nn.Module]`): Activation function used in network, which often use in-place \
                 operation to speedup, e.g. ReLU(inplace=True).
             - last_linear_layer_init_zero (:obj:`bool`): Whether to use zero initializations for the last layer of value/policy mlp, default sets it to True.
-            - state_norm (:obj:`bool`): Whether to use normalization for latent states, default sets it to True.
+            - value_last_linear_layer_init_zero (:obj:`Optional[bool]`): Value-head-specific override for the final
+                layer initialization. ``None`` inherits ``last_linear_layer_init_zero``.
+            - state_norm (:obj:`bool`): Whether to use normalization for latent states, default sets it to False.
+            - representation_last_linear_layer_init_zero (:obj:`Optional[bool]`): Override zero initialization of
+                the representation network's final linear layer. ``None`` preserves the historical behavior.
             - discrete_action_encoding_type (:obj:`str`): The encoding type of discrete action, which can be 'one_hot' or 'not_one_hot'.
             - norm_type (:obj:`str`): The type of normalization in networks. defaults to 'BN'.
+            - ssl_norm_type (:obj:`Optional[str]`): Normalization used only by the SSL projection and prediction
+                heads. When omitted, it inherits ``norm_type`` for backward compatibility.
             - res_connection_in_dynamics (:obj:`bool`): Whether to use residual connection for dynamics network, default set it to False.
         """
         super(MuZeroModelMLP, self).__init__()
@@ -98,11 +117,41 @@ class MuZeroModelMLP(nn.Module):
         self.pred_out = pred_out
         self.self_supervised_learning_loss = self_supervised_learning_loss
         self.last_linear_layer_init_zero = last_linear_layer_init_zero
+        self.intrinsic_reward_target_transform = str(
+            intrinsic_reward_target_transform
+        ).lower()
+        if self.intrinsic_reward_target_transform not in {'raw', 'log'}:
+            raise ValueError(
+                "intrinsic_reward_target_transform must be 'raw' or 'log', got "
+                f"{intrinsic_reward_target_transform!r}."
+            )
+        self.intrinsic_reward_log_reference = float(intrinsic_reward_log_reference)
+        self.intrinsic_reward_log_epsilon = float(intrinsic_reward_log_epsilon)
+        self.intrinsic_reward_log_max_raw = float(intrinsic_reward_log_max_raw)
+        if self.intrinsic_reward_log_reference <= 0:
+            raise ValueError("intrinsic_reward_log_reference must be positive.")
+        if self.intrinsic_reward_log_epsilon <= 0:
+            raise ValueError("intrinsic_reward_log_epsilon must be positive.")
+        if self.intrinsic_reward_log_max_raw <= 0:
+            raise ValueError("intrinsic_reward_log_max_raw must be positive.")
+        self.value_last_linear_layer_init_zero = (
+            last_linear_layer_init_zero
+            if value_last_linear_layer_init_zero is None
+            else bool(value_last_linear_layer_init_zero)
+        )
         self.state_norm = state_norm
+        if representation_last_linear_layer_init_zero is None:
+            representation_last_linear_layer_init_zero = not self.state_norm
+        self.representation_last_linear_layer_init_zero = bool(representation_last_linear_layer_init_zero)
         self.res_connection_in_dynamics = res_connection_in_dynamics
+        self.ssl_norm_type = norm_type if ssl_norm_type is None else ssl_norm_type
 
         self.representation_network = RepresentationNetworkMLP(
-            observation_shape=observation_shape, hidden_channels=self.latent_state_dim, norm_type=norm_type
+            observation_shape=observation_shape,
+            hidden_channels=self.latent_state_dim,
+            norm_type=norm_type,
+            # A zero vector is singular under per-sample min-max normalization.
+            last_linear_layer_init_zero=self.representation_last_linear_layer_init_zero,
         )
 
         self.dynamics_network = DynamicsNetwork(
@@ -123,7 +172,29 @@ class MuZeroModelMLP(nn.Module):
             policy_head_hidden_channels=policy_head_hidden_channels,
             output_support_size=self.value_support_size,
             last_linear_layer_init_zero=self.last_linear_layer_init_zero,
+            value_last_linear_layer_init_zero=self.value_last_linear_layer_init_zero,
             norm_type=norm_type
+        )
+
+        self.intrinsic_reward_head = MLP_V2(
+            in_channels=latent_state_dim,
+            hidden_channels=intrinsic_reward_head_hidden_channels,
+            out_channels=1,
+            activation=activation,
+            norm_type=norm_type,
+            output_activation=False,
+            output_norm=False,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
+        )
+        self.intrinsic_value_head = MLP_V2(
+            in_channels=latent_state_dim,
+            hidden_channels=intrinsic_value_head_hidden_channels,
+            out_channels=1,
+            activation=activation,
+            norm_type=norm_type,
+            output_activation=False,
+            output_norm=False,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
         )
         
 
@@ -131,16 +202,23 @@ class MuZeroModelMLP(nn.Module):
             # self_supervised_learning_loss related network proposed in EfficientZero
             self.projection_input_dim = latent_state_dim
 
-            self.projection = nn.Sequential(
-                nn.Linear(self.projection_input_dim, self.proj_hid), nn.BatchNorm1d(self.proj_hid), activation,
-                nn.Linear(self.proj_hid, self.proj_hid), nn.BatchNorm1d(self.proj_hid), activation,
-                nn.Linear(self.proj_hid, self.proj_out), nn.BatchNorm1d(self.proj_out)
+            self.projection = MLP_V2(
+                in_channels=self.projection_input_dim,
+                hidden_channels=[self.proj_hid, self.proj_hid],
+                out_channels=self.proj_out,
+                activation=activation,
+                norm_type=self.ssl_norm_type,
+                output_activation=False,
+                output_norm=True,
             )
-            self.prediction_head = nn.Sequential(
-                nn.Linear(self.proj_out, self.pred_hid),
-                nn.BatchNorm1d(self.pred_hid),
-                activation,
-                nn.Linear(self.pred_hid, self.pred_out),
+            self.prediction_head = MLP_V2(
+                in_channels=self.proj_out,
+                hidden_channels=[self.pred_hid],
+                out_channels=self.pred_out,
+                activation=activation,
+                norm_type=self.ssl_norm_type,
+                output_activation=False,
+                output_norm=False,
             )
 
     def initial_inference(self, obs: torch.Tensor) -> MZNetworkOutput:
@@ -237,6 +315,56 @@ class MuZeroModelMLP(nn.Module):
         """
         policy_logits, value = self.prediction_network(latent_state)
         return policy_logits, value
+
+    def transform_intrinsic_reward_target(self, reward: torch.Tensor) -> torch.Tensor:
+        """Map raw intrinsic rewards into the reward head's training space."""
+        if self.intrinsic_reward_target_transform == 'log':
+            reward = reward.float().clamp_min(self.intrinsic_reward_log_epsilon)
+            return torch.log(reward / self.intrinsic_reward_log_reference)
+        return reward
+
+    def inverse_transform_intrinsic_reward_prediction(
+            self, prediction: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode a reward-head prediction into the raw reward used by search."""
+        if self.intrinsic_reward_target_transform == 'log':
+            min_prediction = torch.log(
+                prediction.new_tensor(
+                    self.intrinsic_reward_log_epsilon / self.intrinsic_reward_log_reference
+                )
+            )
+            max_prediction = torch.log(
+                prediction.new_tensor(
+                    self.intrinsic_reward_log_max_raw / self.intrinsic_reward_log_reference
+                )
+            )
+            return self.intrinsic_reward_log_reference * torch.exp(
+                prediction.clamp(min=min_prediction, max=max_prediction)
+            )
+        return prediction
+
+    def intrinsic_reward_prediction_from_latent(
+            self, latent_state: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the intrinsic reward prediction in its training space."""
+        return self.intrinsic_reward_head(latent_state)
+
+    def intrinsic_reward_from_latent(self, latent_state: torch.Tensor) -> torch.Tensor:
+        """
+        Predict the scalar intrinsic reward associated with entering ``latent_state``.
+
+        This is used by the ensemble RND exploration path: real RND errors from
+        observed next states train this head, and imagined MCTS transitions use
+        this learned head because imagined nodes do not have real observations.
+        """
+        prediction = self.intrinsic_reward_prediction_from_latent(latent_state)
+        return self.inverse_transform_intrinsic_reward_prediction(prediction)
+
+    def intrinsic_value_from_latent(self, latent_state: torch.Tensor) -> torch.Tensor:
+        """
+        Predict the scalar discounted future intrinsic return from ``latent_state``.
+        """
+        return self.intrinsic_value_head(latent_state)
 
     def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

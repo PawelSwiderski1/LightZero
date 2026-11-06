@@ -456,7 +456,10 @@ def prepare_obs_stack_for_unizero(obs_batch_ori: np.ndarray, cfg: EasyDict) -> T
 
     # Initialize the target batch for self-supervised learning if applicable.
     obs_target_batch = None
-    if cfg.model.self_supervised_learning_loss:
+    if (
+            cfg.model.self_supervised_learning_loss
+            or float(cfg.get('raw_latent_ssl_loss_weight', 0.0)) > 0.0
+    ):
         if cfg.model.model_type == 'conv':
             # Prepare the target batch for convolutional models.
             obs_target_batch = (
@@ -507,7 +510,10 @@ def prepare_obs(obs_batch_ori: np.ndarray, cfg: EasyDict, task_id = None) -> Tup
     # Initialize the target batch for consistency loss as `None`. It will only be set if consistency loss calculation is enabled.
     obs_target_batch = None
     # If the model configuration specifies the use of self-supervised learning loss, prepare the target batch for the consistency loss.
-    if cfg.model.self_supervised_learning_loss:
+    if (
+            cfg.model.self_supervised_learning_loss
+            or float(cfg.get('raw_latent_ssl_loss_weight', 0.0)) > 0.0
+    ):
         # Determine the starting dimension to exclude based on the model type.
         # For 'conv', exclude the first 'image_channel' dimensions.
         # For 'mlp', exclude the first 'observation_shape' dimensions.

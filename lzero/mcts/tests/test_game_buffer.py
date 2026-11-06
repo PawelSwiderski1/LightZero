@@ -132,6 +132,14 @@ def test_sample_orig_data():
     # context = (game_lst, game_pos_lst, indices_lst, weights, make_time)
     print(context)
 
+    _, _, indices, _, make_time = context
+    assert all(sample_time > buffer.clear_time for sample_time in make_time)
+
+    updated_priorities = np.array([0.123, 0.456])
+    train_data = [[[], [], [], indices, [], make_time], []]
+    buffer.update_priority(train_data, updated_priorities)
+    np.testing.assert_allclose(buffer.game_pos_priorities[indices], updated_priorities)
+
 
 @pytest.mark.unittest
 def test_non_sampled_varied_action_policy_maps_to_action_ids():

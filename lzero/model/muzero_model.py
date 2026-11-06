@@ -31,6 +31,14 @@ class MuZeroModel(nn.Module):
         reward_head_hidden_channels: SequenceType = [32],
         value_head_hidden_channels: SequenceType = [32],
         policy_head_hidden_channels: SequenceType = [32],
+        intrinsic_reward_head_channels: int = 16,
+        intrinsic_value_head_channels: int = 16,
+        intrinsic_reward_head_hidden_channels: SequenceType = [32],
+        intrinsic_value_head_hidden_channels: SequenceType = [32],
+        intrinsic_reward_target_transform: str = 'raw',
+        intrinsic_reward_log_reference: float = 1e-2,
+        intrinsic_reward_log_epsilon: float = 1e-8,
+        intrinsic_reward_log_max_raw: float = 5.0,
         reward_support_range: SequenceType =(-300., 301., 1.),
         value_support_range: SequenceType =(-300., 301., 1.),
         proj_hid: int = 1024,
@@ -118,11 +126,37 @@ class MuZeroModel(nn.Module):
         self.state_norm = state_norm
         self.downsample = downsample
         self.analysis_sim_norm = analysis_sim_norm
+        self.intrinsic_reward_target_transform = str(
+            intrinsic_reward_target_transform
+        ).lower()
+        if self.intrinsic_reward_target_transform not in {'raw', 'log'}:
+            raise ValueError(
+                "intrinsic_reward_target_transform must be 'raw' or 'log', got "
+                f"{intrinsic_reward_target_transform!r}."
+            )
+        self.intrinsic_reward_log_reference = float(intrinsic_reward_log_reference)
+        self.intrinsic_reward_log_epsilon = float(intrinsic_reward_log_epsilon)
+        self.intrinsic_reward_log_max_raw = float(intrinsic_reward_log_max_raw)
+        if self.intrinsic_reward_log_reference <= 0:
+            raise ValueError("intrinsic_reward_log_reference must be positive.")
+        if self.intrinsic_reward_log_epsilon <= 0:
+            raise ValueError("intrinsic_reward_log_epsilon must be positive.")
+        if self.intrinsic_reward_log_max_raw <= 0:
+            raise ValueError("intrinsic_reward_log_max_raw must be positive.")
 
-        if observation_shape[1] == 96:
-            latent_size = math.ceil(observation_shape[1] / 16) * math.ceil(observation_shape[2] / 16)
+        if not downsample:
+            latent_height = observation_shape[1]
+            latent_width = observation_shape[2]
+        elif observation_shape[1] in [84, 96]:
+            latent_height = math.ceil(observation_shape[1] / 16)
+            latent_width = math.ceil(observation_shape[2] / 16)
         elif observation_shape[1] == 64:
-            latent_size = math.ceil(observation_shape[1] / 8) * math.ceil(observation_shape[2] / 8)
+            latent_height = math.ceil(observation_shape[1] / 8)
+            latent_width = math.ceil(observation_shape[2] / 8)
+        else:
+            latent_height = observation_shape[1]
+            latent_width = observation_shape[2]
+        latent_size = latent_height * latent_width
 
         flatten_input_size_for_reward_head = (
             (reward_head_channels * latent_size) if downsample else
@@ -181,6 +215,27 @@ class MuZeroModel(nn.Module):
             last_linear_layer_init_zero=self.last_linear_layer_init_zero,
             activation=activation,
             norm_type=norm_type
+        )
+
+        self.intrinsic_reward_head = ScalarLatentHead(
+            num_channels,
+            intrinsic_reward_head_channels,
+            intrinsic_reward_head_hidden_channels,
+            latent_height,
+            latent_width,
+            activation=activation,
+            norm_type=norm_type,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
+        )
+        self.intrinsic_value_head = ScalarLatentHead(
+            num_channels,
+            intrinsic_value_head_channels,
+            intrinsic_value_head_hidden_channels,
+            latent_height,
+            latent_width,
+            activation=activation,
+            norm_type=norm_type,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
         )
         
             
@@ -306,6 +361,45 @@ class MuZeroModel(nn.Module):
         """
         return self.prediction_network(latent_state)
 
+    def transform_intrinsic_reward_target(self, reward: torch.Tensor) -> torch.Tensor:
+        if self.intrinsic_reward_target_transform == 'log':
+            reward = reward.float().clamp_min(self.intrinsic_reward_log_epsilon)
+            return torch.log(reward / self.intrinsic_reward_log_reference)
+        return reward
+
+    def inverse_transform_intrinsic_reward_prediction(
+            self, prediction: torch.Tensor
+    ) -> torch.Tensor:
+        if self.intrinsic_reward_target_transform == 'log':
+            min_prediction = torch.log(
+                prediction.new_tensor(
+                    self.intrinsic_reward_log_epsilon
+                    / self.intrinsic_reward_log_reference
+                )
+            )
+            max_prediction = torch.log(
+                prediction.new_tensor(
+                    self.intrinsic_reward_log_max_raw
+                    / self.intrinsic_reward_log_reference
+                )
+            )
+            return self.intrinsic_reward_log_reference * torch.exp(
+                prediction.clamp(min=min_prediction, max=max_prediction)
+            )
+        return prediction
+
+    def intrinsic_reward_prediction_from_latent(
+            self, latent_state: torch.Tensor
+    ) -> torch.Tensor:
+        return self.intrinsic_reward_head(latent_state)
+
+    def intrinsic_reward_from_latent(self, latent_state: torch.Tensor) -> torch.Tensor:
+        prediction = self.intrinsic_reward_prediction_from_latent(latent_state)
+        return self.inverse_transform_intrinsic_reward_prediction(prediction)
+
+    def intrinsic_value_from_latent(self, latent_state: torch.Tensor) -> torch.Tensor:
+        return self.intrinsic_value_head(latent_state)
+
     def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Overview:
@@ -414,6 +508,51 @@ class MuZeroModel(nn.Module):
 
     def get_params_mean(self) -> float:
         return get_params_mean(self)
+
+
+class ScalarLatentHead(nn.Module):
+    """Predict one scalar from a spatial MuZero latent."""
+
+    def __init__(
+            self,
+            input_channels: int,
+            head_channels: int,
+            hidden_channels: SequenceType,
+            latent_height: int,
+            latent_width: int,
+            activation: nn.Module,
+            norm_type: Optional[str],
+            last_linear_layer_init_zero: bool,
+    ) -> None:
+        super().__init__()
+        if norm_type not in {'BN', 'LN'}:
+            raise ValueError(f"norm_type must be 'BN' or 'LN', got {norm_type!r}.")
+        self.conv = nn.Conv2d(input_channels, head_channels, kernel_size=1)
+        if norm_type == 'BN':
+            self.norm = nn.BatchNorm2d(head_channels)
+        else:
+            self.norm = nn.LayerNorm(
+                [head_channels, latent_height, latent_width]
+            )
+        self.activation = activation
+        if isinstance(hidden_channels, int):
+            hidden_channels = [hidden_channels]
+        else:
+            hidden_channels = list(hidden_channels)
+        self.mlp = MLP_V2(
+            in_channels=head_channels * latent_height * latent_width,
+            hidden_channels=hidden_channels,
+            out_channels=1,
+            activation=activation,
+            norm_type=norm_type,
+            output_activation=False,
+            output_norm=False,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
+        )
+
+    def forward(self, latent_state: torch.Tensor) -> torch.Tensor:
+        features = self.activation(self.norm(self.conv(latent_state)))
+        return self.mlp(features.flatten(start_dim=1))
 
 
 class DynamicsNetwork(nn.Module):

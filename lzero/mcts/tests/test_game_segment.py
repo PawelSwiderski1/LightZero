@@ -1,12 +1,68 @@
 import numpy as np
 import pytest
 import torch
+from easydict import EasyDict
 
-from lzero.mcts.buffer.game_segment import GameSegment
+from lzero.mcts.buffer.game_segment import GameSegment, should_bootstrap_at_trajectory_boundary
 from lzero.mcts.utils import prepare_observation
 from lzero.policy import select_action
 
 args = ["MuZero"]  # ['EfficientZero', 'MuZero']
+
+
+@pytest.mark.unittest
+def test_time_limit_bootstrap_boundary_is_configurable():
+    assert should_bootstrap_at_trajectory_boundary(19, 20, False, False)
+    assert should_bootstrap_at_trajectory_boundary(20, 20, True, True)
+    assert not should_bootstrap_at_trajectory_boundary(20, 20, True, False)
+    assert not should_bootstrap_at_trajectory_boundary(20, 20, False, True)
+
+
+@pytest.mark.unittest
+def test_segment_padding_keeps_per_action_metadata_aligned():
+    config = EasyDict(
+        num_unroll_steps=2,
+        td_steps=3,
+        discount_factor=0.99,
+        gray_scale=False,
+        transform2string=False,
+        sampled_algo=False,
+        gumbel_algo=False,
+        use_ture_chance_label_in_chance_encoder=False,
+        model=dict(
+            frame_stack_num=1,
+            observation_shape=(2,),
+            action_space_size=3,
+        ),
+    )
+    segment = GameSegment(3, game_segment_length=2, config=config)
+    segment.reset([np.zeros(2, dtype=np.float32)])
+    segment.append(
+        0,
+        np.ones(2, dtype=np.float32),
+        np.asarray([0.0]),
+        action_mask=np.asarray([1, 1, 1], dtype=np.int8),
+        to_play=-1,
+        timestep=0,
+    )
+    segment.pad_over(
+        next_segment_observations=[np.full(2, 2.0, dtype=np.float32)],
+        next_segment_rewards=[np.asarray([0.0])],
+        next_segment_actions=[2],
+        next_segment_root_values=[0.0],
+        next_segment_child_visits=[[0.2, 0.3, 0.5]],
+        next_segment_action_masks=[np.asarray([1, 0, 1], dtype=np.int8)],
+        next_segment_to_plays=[2],
+        next_segment_timesteps=[11],
+    )
+
+    assert len(segment.action_segment) == 2
+    assert len(segment.action_mask_segment) == 2
+    assert len(segment.to_play_segment) == 2
+    assert len(segment.timestep_segment) == 2
+    assert np.array_equal(segment.action_mask_segment[1], [1, 0, 1])
+    assert segment.to_play_segment[1] == 2
+    assert segment.timestep_segment[1] == 11
 
 
 @pytest.mark.unittest

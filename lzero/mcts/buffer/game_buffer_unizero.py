@@ -11,7 +11,6 @@ from .game_buffer_muzero import MuZeroGameBuffer
 
 if TYPE_CHECKING:
     from lzero.policy import MuZeroPolicy, EfficientZeroPolicy, SampledEfficientZeroPolicy
-from line_profiler import line_profiler
 
 
 @BUFFER_REGISTRY.register('game_buffer_unizero')

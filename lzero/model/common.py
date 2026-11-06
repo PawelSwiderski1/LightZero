@@ -20,7 +20,6 @@ from ditk import logging
 from ding.torch_utils import MLP, ResBlock
 from ding.torch_utils.network.normalization import build_normalization
 from ding.utils import SequenceType, get_rank, get_world_size
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from ding.utils import set_pkg_seed, get_rank, get_world_size
 
 
@@ -372,6 +371,8 @@ class QwenNetwork(nn.Module):
                  group_size: int = 8,
                  tokenizer=None):
         super().__init__()
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         logging.info(f"Loading Qwen model from: {model_path}")
         
@@ -800,6 +801,7 @@ class RepresentationNetworkMLP(nn.Module):
             norm_type: Optional[str] = 'BN',
             group_size: int = 8,
             final_norm_option_in_encoder: str = 'LayerNorm', # TODO
+            last_linear_layer_init_zero: bool = True,
     ) -> torch.Tensor:
         """
         Arguments:
@@ -809,6 +811,7 @@ class RepresentationNetworkMLP(nn.Module):
             - activation (:obj:`nn.Module`): The activation function to use.
             - norm_type (:obj:`Optional[str]`): The type of normalization ('BN', 'LN', or None).
             - group_size (:obj:`int`): The group size for the final `SimNorm` layer.
+            - last_linear_layer_init_zero (:obj:`bool`): Whether to zero-initialize the output projection.
         """
         super().__init__()
         # Creating hidden layers list for MLP_V2
@@ -822,7 +825,7 @@ class RepresentationNetworkMLP(nn.Module):
             norm_type=norm_type,
             output_activation=False,
             output_norm=False,
-            last_linear_layer_init_zero=True,
+            last_linear_layer_init_zero=last_linear_layer_init_zero,
         )
 
         # Select the normalization method based on the final_norm_option_in_encoder parameter.
@@ -1134,10 +1137,16 @@ class PredictionNetwork(nn.Module):
         self.conv1x1_value = nn.Conv2d(num_channels, value_head_channels, 1)
         self.conv1x1_policy = nn.Conv2d(num_channels, policy_head_channels, 1)
 
-        if observation_shape[1] == 96:
-            latent_shape = (observation_shape[1] / 16, observation_shape[2] / 16)
+        if observation_shape[1] in [84, 96]:
+            latent_shape = (
+                math.ceil(observation_shape[1] / 16),
+                math.ceil(observation_shape[2] / 16),
+            )
         elif observation_shape[1] == 64:
-            latent_shape = (observation_shape[1] / 8, observation_shape[2] / 8)
+            latent_shape = (
+                math.ceil(observation_shape[1] / 8),
+                math.ceil(observation_shape[2] / 8),
+            )
 
         if norm_type == 'BN':
             self.norm_value = nn.BatchNorm2d(value_head_channels)
@@ -1225,6 +1234,7 @@ class PredictionNetworkMLP(nn.Module):
             policy_head_hidden_channels: List[int] = [32],
             output_support_size: int = 601,
             last_linear_layer_init_zero: bool = True,
+            value_last_linear_layer_init_zero: Optional[bool] = None,
             activation: nn.Module = nn.ReLU(inplace=True),
             norm_type: Optional[str] = 'BN',
     ):
@@ -1237,10 +1247,14 @@ class PredictionNetworkMLP(nn.Module):
             - policy_head_hidden_channels (:obj:`List[int]`): Hidden layer sizes for the policy MLP head.
             - output_support_size (:obj:`int`): The size of the categorical value distribution.
             - last_linear_layer_init_zero (:obj:`bool`): Whether to initialize the last layer of heads to zero.
+            - value_last_linear_layer_init_zero (:obj:`Optional[bool]`): Value-head-specific override for the final
+                layer initialization. ``None`` inherits ``last_linear_layer_init_zero``.
             - activation (:obj:`nn.Module`): The activation function.
             - norm_type (:obj:`Optional[str]`): The normalization type.
         """
         super().__init__()
+        if value_last_linear_layer_init_zero is None:
+            value_last_linear_layer_init_zero = last_linear_layer_init_zero
         
         common_hidden = [num_channels] * (common_layer_num - 1) if common_layer_num > 1 else []
         self.fc_prediction_common = MLP_V2(
@@ -1262,7 +1276,7 @@ class PredictionNetworkMLP(nn.Module):
             norm_type=norm_type,
             output_activation=False,
             output_norm=False,
-            last_linear_layer_init_zero=last_linear_layer_init_zero
+            last_linear_layer_init_zero=value_last_linear_layer_init_zero
         )
         self.fc_policy_head = MLP_V2(
             in_channels=num_channels,

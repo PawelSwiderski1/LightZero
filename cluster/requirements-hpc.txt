@@ -1,0 +1,12 @@
+-r ../requirements.txt
+
+# The MountainCar code path still uses the pre-Gymnasium API through DI-engine.
+gym==0.25.1
+tensorboard
+tensorboardX
+Cython<3
+
+# Match the working local pair. Unconstrained resolution selected wandb 0.12.16
+# with protobuf 7.x, whose generated protobuf bindings are incompatible.
+wandb==0.19.0
+protobuf==5.29.6

@@ -19,6 +19,37 @@ data_*
 !lzero/loss_landscape/images/**/*.png
 *.csv
 
+# Local Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.venv-*/
+venv/
+
+# Local experiment outputs and fetched cluster artifacts
+/.hpc_runs/
+/.local_runs/
+/hpc_results/
+/local_logs/
+/lz_result/
+/video/
+/cleanup_manifests/
+slurm-*.out
+slurm-*.err
+
+# Model checkpoints are generated artifacts. Curated scalar/JSON reports
+# belong under docs/research/results instead.
+*.ckpt
+*.pth
+*.pth.tar
+ckpt/
+checkpoint/
+
 pkg/
 src/
 

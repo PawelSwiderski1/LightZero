@@ -14,7 +14,9 @@ from dizoo.minigrid.envs.minigrid_wrapper import ViewSizeWrapper
 from dizoo.minigrid.envs.minigrid_env import MiniGridEnv
 from easydict import EasyDict
 from matplotlib import animation
-from minigrid.wrappers import FlatObsWrapper
+from minigrid.wrappers import FlatObsWrapper, ImgObsWrapper, RGBImgObsWrapper, RGBImgPartialObsWrapper
+
+from zoo.minigrid.envs.branching_rooms_env import BRANCHING_ROOMS_ENV_ID
 
 
 @ENV_REGISTRY.register('minigrid_lightzero')
@@ -39,6 +41,12 @@ class MiniGridEnvLightZero(MiniGridEnv):
         # (str or None) The path to save the replay gif. If None, the replay gif will not be saved.
         replay_path_gif=None,
         flat_obs=True,
+        # Supported modes are ``flat``, ``rgb_partial``, ``rgb_full``, and ``raw``.
+        # ``None`` retains the legacy behavior controlled by ``flat_obs``.
+        observation_mode=None,
+        rgb_tile_size=12,
+        scale_observation=True,
+        agent_view_size=7,
         # (int) The maximum number of steps for each episode.
         max_step=300,
     )
@@ -66,7 +74,15 @@ class MiniGridEnvLightZero(MiniGridEnv):
         self._cfg = cfg
         self._init_flag = False
         self._env_id = cfg.env_id
-        self._flat_obs = cfg.flat_obs
+        configured_mode = getattr(cfg, 'observation_mode', None)
+        if configured_mode is None:
+            configured_mode = 'flat' if cfg.flat_obs else 'raw'
+        if configured_mode not in {'flat', 'rgb_partial', 'rgb_full', 'raw'}:
+            raise ValueError(f'Unsupported MiniGrid observation mode: {configured_mode}')
+        self._observation_mode = configured_mode
+        self._flat_obs = configured_mode == 'flat'
+        self._rgb_tile_size = int(getattr(cfg, 'rgb_tile_size', 12))
+        self._scale_observation = bool(getattr(cfg, 'scale_observation', True))
         self._save_replay_gif = cfg.save_replay_gif
         self._replay_path_gif = cfg.replay_path_gif
         self._max_step = cfg.max_step
@@ -81,10 +97,15 @@ class MiniGridEnvLightZero(MiniGridEnv):
             - obs (:obj:`np.ndarray`): Initial observation from the environment.
         """
         if not self._init_flag:
+            make_kwargs = {}
+            if self._env_id == BRANCHING_ROOMS_ENV_ID:
+                make_kwargs.update(
+                    max_steps=self._max_step,
+                    agent_view_size=int(getattr(self._cfg, 'agent_view_size', 7)),
+                )
             if self._save_replay_gif:
-                self._env = gym.make(self._env_id, render_mode="rgb_array")
-            else:
-                self._env = gym.make(self._env_id)
+                make_kwargs['render_mode'] = 'rgb_array'
+            self._env = gym.make(self._env_id, **make_kwargs)
             # NOTE: customize the max step of the env
             self._env.max_steps = self._max_step
 
@@ -94,15 +115,29 @@ class MiniGridEnvLightZero(MiniGridEnv):
                 self._env = ViewSizeWrapper(self._env, agent_view_size=5)
             if self._env_id == 'MiniGrid-AKTDT-7x7-1-v0':
                 self._env = ViewSizeWrapper(self._env, agent_view_size=3)
-            if self._flat_obs:
+            if self._observation_mode == 'flat':
                 self._env = FlatObsWrapper(self._env)
-                # self._env = ImgObsWrapper(self._env)
-                # self._env = RGBImgPartialObsWrapper(self._env)
+            elif self._observation_mode == 'rgb_partial':
+                self._env = RGBImgPartialObsWrapper(self._env, tile_size=self._rgb_tile_size)
+                self._env = ImgObsWrapper(self._env)
+            elif self._observation_mode == 'rgb_full':
+                self._env = RGBImgObsWrapper(self._env, tile_size=self._rgb_tile_size)
+                self._env = ImgObsWrapper(self._env)
             if hasattr(self._cfg, 'obs_plus_prev_action_reward') and self._cfg.obs_plus_prev_action_reward:
                 self._env = ObsPlusPrevActRewWrapper(self._env)
             self._init_flag = True
-        if self._flat_obs:
+        if self._observation_mode == 'flat':
             self._observation_space = gym.spaces.Box(0, 1, shape=(2835, ))
+        elif self._observation_mode in {'rgb_partial', 'rgb_full'}:
+            height, width, channels = self._env.observation_space.shape
+            high = 1.0 if self._scale_observation else 255.0
+            dtype = np.float32 if self._scale_observation else np.uint8
+            self._observation_space = gym.spaces.Box(
+                low=0.0,
+                high=high,
+                shape=(channels, height, width),
+                dtype=dtype,
+            )
         else:
             self._observation_space = self._env.observation_space
             # to be compatible with subprocess env manager
@@ -111,18 +146,24 @@ class MiniGridEnvLightZero(MiniGridEnv):
             else:
                 self._observation_space.dtype = np.dtype('float32')
         self._action_space = self._env.action_space
+        reward_range = getattr(
+            self._env,
+            'reward_range',
+            getattr(self._env.unwrapped, 'reward_range', (-float('inf'), float('inf'))),
+        )
         self._reward_space = gym.spaces.Box(
-            low=self._env.reward_range[0], high=self._env.reward_range[1], shape=(1, ), dtype=np.float32
+            low=reward_range[0], high=reward_range[1], shape=(1, ), dtype=np.float32
         )
         if hasattr(self, '_seed') and hasattr(self, '_dynamic_seed') and self._dynamic_seed:
             np_seed = 100 * np.random.randint(1, 1000)
             self._seed = self._seed + np_seed
-            obs, _ = self._env.reset(seed=self._seed)  # using the reset method of Gymnasium env
+            obs, reset_info = self._env.reset(seed=self._seed)  # using the reset method of Gymnasium env
         elif hasattr(self, '_seed'):
-            obs, _ = self._env.reset(seed=self._seed)
+            obs, reset_info = self._env.reset(seed=self._seed)
         else:
-            obs, _ = self._env.reset()
-        obs = to_ndarray(obs)
+            obs, reset_info = self._env.reset()
+        self._last_reset_info = reset_info
+        obs = self._format_observation(obs)
         self._eval_episode_return = 0
         self._current_step = 0
         if self._save_replay_gif:
@@ -131,6 +172,9 @@ class MiniGridEnvLightZero(MiniGridEnv):
         action_mask = np.ones(self.action_space.n, 'int8')
         self._timestep = 0
         obs = {'observation': obs, 'action_mask': action_mask, 'to_play': -1, 'timestep': self._timestep}
+        environment_state = self._environment_state_from_info(reset_info)
+        if environment_state is not None:
+            obs['environment_state'] = environment_state
 
         return obs
 
@@ -171,9 +215,12 @@ class MiniGridEnvLightZero(MiniGridEnv):
         if isinstance(action, np.ndarray) and action.shape == (1, ):
             action = action.squeeze()  # 0-dim array
         if self._save_replay_gif:
-            self._frames.append(self._env.render())
+            frame = self._render_replay_frame()
+            if frame is not None:
+                self._frames.append(frame)
         # using the step method of Gymnasium env, return is (observation, reward, terminated, truncated, info)
         obs, rew, terminated, truncated, info = self._env.step(action)
+        info['time_limit_truncated'] = bool(truncated)
         done = terminated or truncated
         rew = float(rew)
         self._eval_episode_return += rew
@@ -184,7 +231,7 @@ class MiniGridEnvLightZero(MiniGridEnv):
             info['eval_episode_return'] = self._eval_episode_return
             info['current_step'] = self._current_step
             info['max_step'] = self._max_step
-            if self._save_replay_gif:
+            if self._save_replay_gif and self._frames:
                 if not os.path.exists(self._replay_path_gif):
                     os.makedirs(self._replay_path_gif)
                 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -195,7 +242,7 @@ class MiniGridEnvLightZero(MiniGridEnv):
                 self.display_frames_as_gif(self._frames, path)
                 print(f'save episode {self._save_replay_count} in {self._replay_path_gif}!')
                 self._save_replay_count += 1
-        obs = to_ndarray(obs)
+        obs = self._format_observation(obs)
         rew = to_ndarray(rew)  # wrapped to be transferred to an array with shape (1,)
 
         action_mask = np.ones(self.action_space.n, 'int8')
@@ -203,6 +250,49 @@ class MiniGridEnvLightZero(MiniGridEnv):
         obs = {'observation': obs, 'action_mask': action_mask, 'to_play': -1, 'timestep': self._timestep}
 
         return BaseEnvTimestep(obs, rew, done, info)
+
+    def _format_observation(self, obs: np.ndarray) -> np.ndarray:
+        if self._observation_mode not in {'rgb_partial', 'rgb_full'}:
+            return to_ndarray(obs)
+
+        obs = np.asarray(obs)
+        if obs.ndim != 3 or obs.shape[-1] not in (1, 3, 4):
+            raise ValueError(f'Expected an HWC RGB observation, got shape {obs.shape}')
+        obs = np.transpose(obs[..., :3], (2, 0, 1))
+        if self._scale_observation:
+            return obs.astype(np.float32) / 255.0
+        return obs.astype(np.uint8)
+
+    def _render_replay_frame(self) -> Optional[np.ndarray]:
+        render_mode = getattr(
+            self._env,
+            'render_mode',
+            getattr(self._env.unwrapped, 'render_mode', None),
+        )
+        if render_mode == 'rgb_array':
+            return self._env.render()
+        get_frame = getattr(self._env.unwrapped, 'get_frame', None)
+        if get_frame is None:
+            return self._env.render()
+        return get_frame(tile_size=self._rgb_tile_size)
+
+    @staticmethod
+    def _environment_state_from_info(info):
+        position = info.get('agent_position', None)
+        if position is None:
+            return None
+        room = info.get('room_id', None)
+        room_row, room_col = (-1, -1) if room is None else room
+        return np.asarray(
+            [
+                int(position[0]),
+                int(position[1]),
+                int(info.get('agent_direction', -1)),
+                int(room_row),
+                int(room_col),
+            ],
+            dtype=np.int32,
+        )
 
     def random_action(self) -> np.ndarray:
         """
@@ -218,9 +308,13 @@ class MiniGridEnvLightZero(MiniGridEnv):
         """
         if replay_path is None:
             replay_path = './video'
+        self._save_replay_gif = True
+        self._replay_path_gif = replay_path
+        # Retain the legacy fields used by the upstream DI-engine wrapper.
         self._save_replay = True
         self._replay_path = replay_path
         self._save_replay_count = 0
+        self._frames = []
 
     @staticmethod
     def display_frames_as_gif(frames: list, path: str) -> None:

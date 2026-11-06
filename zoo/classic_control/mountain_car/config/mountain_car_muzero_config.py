@@ -19,6 +19,7 @@ mountain_car_muzero_config = dict(
     exp_name=f'mountain_car_muzero_ns{num_simulations}_upc{update_per_collect}_rer{reanalyze_ratio}_seed0',
     env=dict(
         env_name='MountainCar-v0',
+        max_episode_steps=200,
         continuous=False,
         manually_discretization=False,
         collector_env_num=collector_env_num,

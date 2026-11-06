@@ -251,6 +251,9 @@ class MuZeroSegmentCollector(ISerialCollector):
 
         # NOTE: Specific padding logic for UniZero.
         pad_action_lst = game_segments[i].action_segment[:self.policy_config.num_unroll_steps + self.policy_config.td_steps]
+        pad_action_mask_lst = game_segments[i].action_mask_segment[:self.policy_config.num_unroll_steps + self.policy_config.td_steps]
+        pad_to_play_lst = game_segments[i].to_play_segment[:self.policy_config.num_unroll_steps + self.policy_config.td_steps]
+        pad_timestep_lst = game_segments[i].timestep_segment[:self.policy_config.num_unroll_steps + self.policy_config.td_steps]
         pad_child_visits_lst = game_segments[i].child_visit_segment[:self.policy_config.num_unroll_steps + self.policy_config.td_steps]
 
         beg_index = 0
@@ -271,17 +274,26 @@ class MuZeroSegmentCollector(ISerialCollector):
         if self.policy_config.gumbel_algo:
             last_game_segments[i].pad_over(
                 pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst,
-                next_segment_improved_policy=pad_improved_policy_prob
+                next_segment_improved_policy=pad_improved_policy_prob,
+                next_segment_action_masks=pad_action_mask_lst,
+                next_segment_to_plays=pad_to_play_lst,
+                next_segment_timesteps=pad_timestep_lst,
             )
         else:
             if self.policy_config.use_ture_chance_label_in_chance_encoder:
                 last_game_segments[i].pad_over(
                     pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst,
-                    next_chances=chance_lst
+                    next_chances=chance_lst,
+                    next_segment_action_masks=pad_action_mask_lst,
+                    next_segment_to_plays=pad_to_play_lst,
+                    next_segment_timesteps=pad_timestep_lst,
                 )
             else:
                 last_game_segments[i].pad_over(
-                    pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst
+                    pad_obs_lst, pad_reward_lst, pad_action_lst, pad_root_values_lst, pad_child_visits_lst,
+                    next_segment_action_masks=pad_action_mask_lst,
+                    next_segment_to_plays=pad_to_play_lst,
+                    next_segment_timesteps=pad_timestep_lst,
                 )
 
         last_game_segments[i].game_segment_to_array()

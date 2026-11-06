@@ -1,0 +1,718 @@
+\documentclass{article}
+\usepackage{iclr2027_conference,times}
+\usepackage{amsmath,amssymb}
+\usepackage[colorlinks=true,citecolor=black,linkcolor=black,urlcolor=blue]{hyperref}
+
+\iclrfinalcopy
+
+\title{Exploration-Aware Latent World Models for MuZero Planning\\[0.4em]
+\large Thesis Research Proposal}
+\author{Pawel Swiderski}
+\date{\today}
+
+\begin{document}
+\maketitle
+\lhead{Thesis Research Proposal}
+
+\begin{abstract}
+Sparse-reward tasks may require coordinated action sequences before any task
+reward is observed. MuZero can guide tree search using learned intrinsic reward
+and value predictions, but the RND signal does not decrease when an observation
+is revisited before the next network update. Outcomes not yet experienced also
+provide no direct reward supervision for the learned intrinsic heads.
+This thesis investigates a separate observation-grounded world model that
+predicts the observations resulting from candidate action sequences. Predicted
+observation embeddings are compared with real episodic memory and temporary
+branch memory to estimate whether an outcome has already been encountered.
+Predicted observations are also evaluated by the current Random Network
+Distillation (RND) networks, providing an alternative estimate of future
+intrinsic reward. The study will compare this estimate with MuZero's learned
+intrinsic reward head and test combinations selected on development layouts.
+Experiments in partially observed, sparse-reward navigation will evaluate
+revisit detection, RND-reward estimation, coverage, and hidden-goal discovery
+under matched interaction and search budgets. The analysis will distinguish
+improvements in prediction accuracy from improvements in exploration.
+\end{abstract}
+
+\section{Introduction and Motivation}
+
+Sparse-reward problems may require an agent to commit to a sequence of actions
+before receiving useful feedback from the task. Effective exploration can
+therefore require passing through familiar states to reach unexplored regions,
+which choosing random actions independently may fail to accomplish
+\citep{bootstrapped-dqn}.
+
+MuZero is a natural starting point because its MCTS evaluates possible action
+sequences in a learned latent model \citep{muzero}. An intrinsic reward can be
+added to the task reward, with separate reward and value heads used to predict
+its effect during search. Random Network Distillation (RND), for example,
+gives a high intrinsic reward when a learned predictor has high error on an
+observation \citep{rnd}. After the agent has received such a reward, the
+intrinsic value head can learn the returns from preceding states, allowing that
+reward to influence planning even when its location lies beyond the explicit
+search horizon. \citet{walker23} provide a direct precedent for training a
+MuZero-style model with RND and distinguish the intrinsic signal predicted
+during planning from the signal measured on real observations.
+
+During data collection, the RND predictor and MuZero networks are held fixed
+for a sequence of actions. Encountering the same observation twice before the
+next update therefore produces exactly the same RND reward both times.
+MuZero's intrinsic heads are also unchanged between the two visits, so they
+cannot learn from the first visit before scoring the second. Updating RND alone
+would still leave the predictions used by MuZero during search unchanged.
+Furthermore, outcomes not yet experienced provide no direct reward supervision
+for MuZero's intrinsic heads, although the heads may generalize from related
+observations.
+
+This thesis investigates a separate observation-grounded world model that
+predicts the observations resulting from candidate action sequences. Its
+predicted embeddings are compared with episodic memory to estimate revisits,
+while its decoded observations are evaluated by the current RND networks to
+estimate future intrinsic rewards. This direct estimate does not require a
+previously collected RND reward label for the candidate outcome, but it depends
+on accurate observation prediction. The study will compare direct and
+head-based RND estimates across planning depths and evaluate combinations
+selected on development layouts.
+
+Intrinsic rewards already shape MuZero's latent state: once intrinsic reward
+and value are training targets, the latent must retain the information needed
+to predict them. The problem is narrower. Predicting scalar rewards and values
+does not require distances in the latent space to tell us whether two states
+are the same. Different locations can have similar intrinsic returns, and the
+same location is novel early in an episode but familiar after a visit. The
+separate model is introduced to support observation comparison and direct
+evaluation of imagined outcomes. MuZero's intrinsic value head keeps its
+existing role of carrying experienced RND rewards beyond the explicit search
+horizon.
+
+\section{Related Work}
+
+MuZero learns representation, dynamics, reward, policy, and value functions
+for tree search without reconstructing the environment state \citep{muzero}.
+The value-equivalence principle explains why a model can preserve the
+information needed for its value predictions while discarding other state
+details \citep{value-equivalence}. This can be useful for planning, but scalar
+task and intrinsic targets do not require distances in the latent space to
+identify repeated states.
+
+RND uses prediction error against fixed random features as a measure of
+long-term novelty \citep{rnd}. Never Give Up (NGU) adds an episodic memory so
+that a state becomes less rewarding after it has been visited in the current
+episode. Agent57 uses the same general mechanism in a multi-policy agent
+\citep{ngu,agent57}. These methods calculate episodic novelty after receiving
+the next real observation. In MCTS, the agent must instead estimate the
+familiarity of a state that has only been imagined.
+
+\citet{walker23} combine a MuZero-style model with RND for intrinsic
+exploration, using learned predictions of the intrinsic reward during
+planning. The present study uses this head-based estimate as a baseline
+and asks whether applying the current RND networks directly to a predicted
+observation provides a more accurate edge reward.
+
+World models such as PlaNet and Dreamer learn recurrent latent dynamics from
+visual trajectories and use predicted trajectories for control
+\citep{planet,dreamer}. Plan2Explore uses a learned world model to seek outcomes
+that are expected to be informative \citep{plan2explore}. The model proposed
+here has a more specific role alongside MuZero: it supplies predicted
+observation representations for episodic comparison and predicted observations
+on which the current RND networks can be evaluated. MuZero continues to provide
+task predictions and the learned intrinsic value function.
+
+GoBI also combines a learned world model with episodic memory, rewarding
+expansion of the set of real and predicted reachable states \citep{gobi}. In the
+present approach, predicted observations are used only while evaluating an
+MCTS branch. They enter temporary branch memory but are never committed to the
+episode's persistent memory.
+
+\section{Problem Formulation}
+
+\subsection{Task and intrinsic prediction in MuZero}
+
+Let $o_t\in\mathcal{O}$ be the observation at time $t$, let
+$a_t\in\mathcal{A}$ be the selected action, and let $H_t$ denote the
+observation--action history through $o_t$. MuZero represents the history and
+recurrently predicts imagined transitions:
+\begin{align}
+    s_t &= h_\theta(H_t), \\
+    (\hat{s}_{t+1},\hat{r}^{\mathrm{task}}_{t+1},
+      \hat{r}^{\mathrm{int}}_{t+1})
+        &= g_\theta(s_t,a_t), \\
+    (\hat{p}_t,\hat{v}^{\mathrm{task}}_t,
+      \hat{v}^{\mathrm{int}}_t)
+        &= f_\theta(s_t).
+\end{align}
+Here $s_t$ is the MuZero latent, $\hat{p}_t$ is the policy prior, and the
+superscripts distinguish task and intrinsic predictions. The heads may share
+some network layers, but the distinction that matters here is between their
+training targets: the intrinsic heads learn from intrinsic rewards collected
+through real interaction.
+
+For RND, a fixed target network $f^\ast$ and a learned predictor $f_\eta$
+define the intrinsic reward of the next observation:
+\begin{equation}
+    r^{\mathrm{RND}}_{t+1}
+      = \left\|f_\eta(o_{t+1})-f^\ast(o_{t+1})\right\|_2^2.
+\end{equation}
+The intrinsic reward head predicts this quantity. The intrinsic value head
+predicts the discounted sum of future intrinsic rewards. For a simulated
+branch of depth $L$, the intrinsic part of the MCTS return is
+\begin{equation}
+    \hat{G}^{\mathrm{int}}_t
+      = \sum_{k=1}^{L}\gamma^{k-1}
+        \hat{r}^{\mathrm{int}}_{t+k}
+        +\gamma^L\hat{v}^{\mathrm{int}}_{t+L},
+\end{equation}
+where $\gamma$ is the discount factor. This value term is what allows an
+intrinsic reward discovered at a distant state to affect earlier decisions
+after the agent has learned from it.
+
+\subsection{Two missing signals}
+
+Let $c$ identify one collection phase. The parameters $\eta_c$ and $\theta_c$
+are the RND and MuZero parameters used during that phase. The agent collects a
+sequence of transitions with these parameters and updates the networks
+afterwards. If it encounters the same observation at times $i$ and $j$ before
+the update, the RND reward is unchanged:
+\begin{equation}
+    o_i=o_j
+    \quad\Longrightarrow\quad
+    r^{\mathrm{RND}}_{\eta_c}(o_i)
+      =r^{\mathrm{RND}}_{\eta_c}(o_j).
+\end{equation}
+Updating $\eta_c$ immediately would change the reward on the real observation,
+but it would not update the reward and value predictions produced by
+$\theta_c$. Synchronizing both components after every visit would require
+additional RND and MuZero optimization between consecutive actions while
+continually moving the intrinsic training targets. RND therefore measures
+familiarity learned before the current collection phase. It does not
+immediately record that an observation has just been encountered in the
+current episode.
+
+The reward head will not be trained on historical RND labels stored at the time
+of collection. After each collection phase, the RND predictor is updated on the
+new observations. A frozen copy of the updated predictor is then used together
+with the fixed target network $f^\ast$ to recompute RND reward and value targets
+from replay observations whenever a batch is sampled. The same frozen networks
+define direct RND evaluation and the realized target used to compare the two
+estimators. Their comparison therefore measures differences between the
+estimators rather than differences in the age of their reward labels.
+
+The second problem concerns an outcome that has never been observed. For a
+candidate branch ending in $o_{t+k}$, neither
+$r^{\mathrm{RND}}(o_{t+k})$ nor its preceding intrinsic return is present in
+the replay data before the first visit. The learned heads can extrapolate from
+related experience, but direct supervision for that particular outcome becomes
+available only after it is observed. An observation-grounded model offers a
+different route: predict the future observation and apply the current RND
+target and predictor to that prediction. This does not require a previously
+observed reward label for the candidate outcome, but it introduces error from
+the world model.
+
+Let $x_t=E_\phi(o_t)$ be the exploration embedding of the individual real
+observation $o_t$. The episodic memory contains only embeddings of observations
+received during the current episode:
+\begin{equation}
+    \mathcal{M}^{\mathrm{ep}}_t
+        =\{\operatorname{norm}(x_i):
+          i\leq t\text{ in the current episode}\}.
+\end{equation}
+It is reset at the episode boundary. Given a predicted future observation
+embedding $\tilde x_{t,k}$, this memory asks whether a similar observation has
+already occurred in the episode. It does not claim to measure lifetime novelty
+or epistemic uncertainty.
+
+\section{Research Question and Hypotheses}
+
+\textbf{Research question.} Can a separate observation-grounded world model
+improve exploration in MuZero by identifying imagined episodic revisits and
+estimating future RND rewards through direct evaluation of predicted
+observations?
+
+\textbf{Representation hypothesis.} Predicted observation embeddings will
+identify same-episode physical-pose revisits more accurately than comparisons
+made with MuZero's latent states.
+
+\textbf{Intrinsic-reward hypothesis.} At planning depths where future
+observations can be predicted accurately, evaluating the current RND networks
+on those predictions will estimate the RND reward of the actual future
+observation more accurately than the learned intrinsic reward head, especially
+for outcomes not represented in its reward supervision.
+
+\textbf{Behavioral hypothesis.} Reducing the intrinsic reward of an imagined
+episodic revisit will reduce repeated local movement. Replacing or correcting
+the learned edge-reward estimate with a more accurate direct RND estimate will
+improve the selection of exploratory action sequences. Together with the
+existing intrinsic value, these changes will improve coverage and sparse-goal
+discovery under a fixed interaction budget.
+
+These claims will be tested separately: episodic correction may help even when
+direct RND does not outperform the reward head, and more accurate predictions
+need not improve action selection.
+
+\section{Proposed Approach}
+
+\subsection{Observation-grounded exploration model}
+
+The exploration model contains an observation encoder $E_\phi$, recurrent
+belief updater $F_\phi$, decoder $D_\phi$, and action-conditioned transition
+model $T_\phi$. A projection $P_\phi$ maps the recurrent prediction back into
+the observation-embedding coordinates. For a real trajectory,
+\begin{align}
+    x_t &= E_\phi(o_t), \\
+    b_t &= F_\phi(b_{t-1},x_t,a_{t-1}), \\
+    \hat{o}_t &= D_\phi(x_t), \\
+    z_t &= \operatorname{norm}(x_t).
+\end{align}
+The recurrent belief $b_t$ incorporates observation and action history for
+prediction. The vector $z_t$ is the normalized observation embedding stored in
+episodic memory and used for nearest-neighbour comparison. It represents the
+individual observation rather than the complete history. This follows the
+practical separation used by episodic-memory agents: history helps predict what
+comes next, while memory records what the agent actually observed
+\citep{ngu}.
+
+Starting from the real root belief $b_t$, a candidate action sequence is
+predicted recursively without access to future observations:
+\begin{align}
+    \tilde b_{t,0} &= b_t, \\
+    \tilde b_{t,k}
+        &=T_\phi(\tilde b_{t,k-1},a_{t+k-1}), \\
+    \tilde x_{t,k} &=P_\phi(\tilde b_{t,k}), \\
+    \tilde o_{t,k} &=D_\phi(\tilde x_{t,k}), \\
+    \tilde z_{t,k}
+        &=\operatorname{norm}(\tilde x_{t,k}),
+        \qquad k=1,\ldots,K.
+\end{align}
+
+The model is trained on real replay sequences with three separate objectives:
+\begin{align}
+    \mathcal{L}_{\mathrm{rec}}
+        &=\mathbb{E}\left[
+          \ell_{\mathrm{obs}}(D_\phi(x_t),o_t)
+          \right], \\
+    \mathcal{L}_{\mathrm{latent}}
+        &=\mathbb{E}\left[
+          \frac{1}{K}\sum_{k=1}^{K}
+          \left\|\tilde z_{t,k}
+          -\operatorname{sg}(z_{t+k})\right\|_2^2
+          \right], \\
+    \mathcal{L}_{\mathrm{future}}
+        &=\mathbb{E}\left[
+          \frac{1}{K}\sum_{k=1}^{K}
+          \ell_{\mathrm{obs}}(\tilde o_{t,k},o_{t+k})
+          \right], \\
+    \mathcal{L}_{\mathrm{expl}}
+        &=\lambda_{\mathrm{rec}}\mathcal{L}_{\mathrm{rec}}
+          +\lambda_{\mathrm{latent}}\mathcal{L}_{\mathrm{latent}}
+          +\lambda_{\mathrm{future}}\mathcal{L}_{\mathrm{future}}.
+\end{align}
+The reconstruction loss encourages the encoder to preserve observation
+information. The latent and future-observation losses train recursive
+predictions to match the future embedding and image, respectively. The image
+prediction loss is needed because direct RND evaluation operates on decoded
+observations. The stop-gradient operator blocks gradients through the target
+embedding in the latent-prediction loss. The representation continues to learn
+between episodes. During an episode, the exploration model is held fixed, so
+all entries in episodic memory use the same encoder. The memory is reset at the
+episode boundary. Physical coordinates and room identity are not used for
+training.
+
+\subsection{Memory-conditioned novelty}
+
+Let $N(z,\mathcal{M})\in[0,1]$ be a normalized novelty score that increases as
+$z$ becomes less similar to the nearby entries in memory $\mathcal{M}$. The
+primary implementation will use a density estimate based on nearest-neighbour
+distances, with its scale estimated from distances among real memory entries
+\citep{ngu}.
+The exact density function is secondary. For the method to work, repeated or
+similar observations must receive a low score, while observations far from the
+stored examples must receive a high score.
+
+When MCTS evaluates a node at depth $k$, let
+\begin{equation}
+    \mathcal{B}_{t,k}
+      =\{\tilde z_{t,1},\ldots,\tilde z_{t,k-1}\}
+\end{equation}
+contain the observation embeddings predicted earlier on that same branch.
+Episodic novelty is
+\begin{equation}
+    n^{\mathrm{ep}}_{t,k}
+        =N\left(
+          \tilde z_{t,k},
+          \mathcal{M}^{\mathrm{ep}}_t\cup\mathcal{B}_{t,k}
+          \right).
+\end{equation}
+Thus, the predicted observation at depth $k$ is compared with both real
+episodic memory and the earlier predictions on its own branch. Suppose a branch
+predicts the sequence $A,B,A$. The first predicted visit to $A$ may receive a
+novelty bonus,
+but the final visit will be compared with the earlier predicted $A$ and should
+receive a low score. Without this temporary branch memory, an imagined loop
+through states absent from real memory could receive the novelty bonus on every
+visit. The set $\mathcal{B}_{t,k}$ is used only while evaluating that branch
+and is discarded after search. Only embeddings of real observations are kept
+in episodic memory.
+
+\subsection{Two estimates of future RND reward}
+
+The learned intrinsic reward head and direct evaluation of the predicted
+observation estimate the same target. For a future observation that is revealed
+by a logged real trajectory, define that target using the RND parameters
+available at the search root:
+\begin{equation}
+    r^{\mathrm{actual}}_{t,k}
+      =\left\|f_\eta(o_{t+k})-f^\ast(o_{t+k})\right\|_2^2.
+\end{equation}
+The ordinary head-based estimate and the direct model-based estimate are
+\begin{align}
+    \hat r^{\mathrm{head}}_{t,k}
+      &=\hat r^{\mathrm{int}}_{t+k}, \\
+    \hat r^{\mathrm{direct}}_{t,k}
+      &=\left\|f_\eta(\tilde o_{t,k})
+                    -f^\ast(\tilde o_{t,k})\right\|_2^2.
+\end{align}
+The first estimate is learned from RND rewards on real transitions in replay.
+The second composes the exploration model with the current RND networks. It can
+score a predicted outcome even when the corresponding real future observation
+has never supplied an RND reward label in replay. However, its score is useful
+only if $\tilde o_{t,k}$ resembles the observation that the environment would
+actually produce. Prediction artefacts may receive high RND error even when the
+real outcome is familiar, while a prediction that looks too familiar may hide
+the novelty of the real outcome.
+
+Because these are estimates of one target, they are compared rather than added.
+Both are first expressed in the raw RND-reward scale by inverting any target
+transform used to train the reward head. A family of edge estimates is then
+defined by
+\begin{equation}
+    \tilde r^{\mathrm{int}}_{t,k}(w_k)
+      =n^{\mathrm{ep}}_{t,k}
+       \left[(1-w_k)\hat r^{\mathrm{head}}_{t,k}
+             +w_k\hat r^{\mathrm{direct}}_{t,k}\right],
+    \qquad 0\leq w_k\leq1.
+\end{equation}
+The setting $w_k=0$ uses the reward head, $w_k=1$ uses direct RND evaluation,
+and intermediate values define hybrids. Depth-dependent weights may be selected
+on development layouts because direct observation prediction is expected to
+become less reliable deeper in the tree. Development diagnostics will compare
+the head-based and direct estimates separately before hybrid weights are
+selected. Final diagnostics will report both estimates at the prespecified
+depths.
+
+For a simulated branch of depth $L$, MCTS backs up
+\begin{equation}
+    \hat G_t
+      =\sum_{k=1}^{L}\gamma^{k-1}
+       \left(
+       \hat r^{\mathrm{task}}_{t+k}
+       +\beta\tilde r^{\mathrm{int}}_{t,k}(w_k)
+       \right)
+       +\gamma^L\left(
+       \hat v^{\mathrm{task}}_{t+L}
+       +\beta\hat v^{\mathrm{int}}_{t+L}
+       \right).
+\end{equation}
+The intrinsic value head remains trained on ungated RND returns. Episodic
+correction therefore applies only to the explicitly simulated part of each
+branch; the leaf value may still assign value to outcomes already visited in
+the current episode. It nevertheless carries experienced intrinsic reward
+beyond the depth of the search tree. Direct RND evaluation is also limited to
+explicitly predicted outcomes and cannot reveal an unseen region beyond the
+exploration model's useful prediction horizon. Separate ablations remove
+episodic gating, use each edge estimator alone, and test the selected hybrid.
+
+\section{Main Experiment}
+
+\subsection{Branching Rooms benchmark}
+
+The main experiment will use a family of Branching Rooms environments built
+with
+MiniGrid \citep{minigrid}. Each layout contains visually marked rooms connected
+by narrow corridors, with branches, loops, bottlenecks, and dead ends. The
+agent receives a local RGB observation and can turn left, turn right, or move
+forward. It does not observe its coordinates or the global room graph.
+Transitions are deterministic. Because the agent sees only part of the maze
+and different places may look alike, it must use its history to distinguish
+some states.
+
+Each episode begins in a designated root room. An unmarked terminal goal is
+placed in a distant dead end; reaching it yields task reward $1$, and every
+other transition yields zero task reward. Before the goal is found, the task
+reward itself supplies no evidence about which exploratory route is useful.
+Necessary corridors and occasional backtracking also ensure that simply
+penalizing every revisit is not an adequate solution.
+
+Layouts will be generated from fixed seeds and divided into development and
+held-out test sets. Development layouts are used to choose the model design,
+memory scale, intrinsic-reward weights, prediction depths, and other
+hyperparameters. Once these choices are fixed, they are not changed in response
+to results on the test layouts. Learned weights and replay data from the
+development layouts are not transferred to the final trials.
+
+On each held-out layout, every method is initialized from scratch and trained
+for $T$ environment interactions. MuZero, the exploration model, the RND
+target and predictor, optimizer state, replay, recurrent state, and episodic
+memory are all initialized anew for each seed--layout trial. Methods are paired
+by layout and random seed, and common components use matched initializations
+where possible.
+Nothing learned in one test trial carries into another. The resulting learning
+curves therefore measure exploration and learning within a previously unseen
+layout, rather than transfer from a pretrained checkpoint. Every method
+receives the same number of interactions and MCTS simulations. Runtime and
+action-selection latency will also be reported because the additional model
+increases computation.
+
+\subsection{Predictive evaluation}
+
+The final runs will include prespecified predictive diagnostics that are not
+used to change the method or its hyperparameters. On evaluation-only logged
+trajectories, episodic familiarity and the two RND estimators will be tested at
+fixed training checkpoints. At a selected search root $t$, the model receives
+the history up to that point and the next logged actions, but not the future
+observations. It predicts $\tilde z_{t,k}$ and $\tilde o_{t,k}$ for depths $1$
+through $K$. The logged trajectory later reveals the observation and physical
+pose actually reached at each depth.
+
+For the primary revisit label, the physical pose consists of grid position and
+orientation. The future pose is a revisit if it appeared at or before the
+selected root or at an earlier step of the logged action suffix. Position-only
+and room coverage are reported separately. Because
+$n^{\mathrm{ep}}_{t,k}$ is high for an outcome predicted to be new, the revisit
+score is $1-n^{\mathrm{ep}}_{t,k}$. Its area under the receiver operating
+characteristic curve (AUC) is reported at every depth. An AUC of $1$ means that
+every revisit is ranked above every non-revisit; an AUC of $0.5$ is random
+ranking.
+
+The RND test compares $\hat r^{\mathrm{head}}_{t,k}$ and
+$\hat r^{\mathrm{direct}}_{t,k}$ with
+$r^{\mathrm{actual}}_{t,k}$ at every depth. Both estimators and the realized
+target use the same RND predictor and target networks, held fixed at the
+diagnostic checkpoint. The analysis reports mean absolute error, Spearman rank
+correlation, and plots of mean predicted against realized reward within
+prediction bins. Results are stratified in two ways: whether the physical pose
+has previously been visited in the current test trial, and whether the exact
+observation has previously appeared in replay available for reward-head
+training. The second distinction identifies outcomes for which no direct reward
+label is available. Simulator pose identifiers are used only to create
+evaluation labels and are not given to the agent or used for training.
+
+The episodic test is run in three ways:
+\begin{itemize}
+    \item using the embedding of the true future observation, which jointly
+    tests the observation representation, memory lookup, and perceptual
+    ambiguity in the observation itself;
+    \item using the predicted future observation embedding, which also tests
+    the transition model; and
+    \item using MuZero's latent state, which tests whether a separate
+    representation is needed.
+\end{itemize}
+In the MuZero-latent control, each real memory entry is the normalized root
+state $h_\theta(H_i)$ produced from the observation history at time $i$. During
+MCTS, the query is the normalized recurrent state produced by applying
+$g_\theta$ along the candidate action sequence. The episodic memory, temporary
+branch memory, novelty function, and use of the episodic factor are otherwise
+unchanged. This control therefore replaces only the source of the stored and
+predicted embeddings.
+
+The target $r^{\mathrm{actual}}_{t,k}$ is the current RND score of the true
+future observation and is available only for offline evaluation. Comparing it
+with direct RND on the predicted observation measures the error introduced by
+the exploration model.
+
+\subsection{Behavioral evaluation}
+
+The core behavioral study crosses two edge estimators, head-based and direct,
+with episodic gating either disabled or enabled. The development-selected
+hybrid is also evaluated with both gating settings. The comparisons therefore
+include:
+\begin{itemize}
+    \item the learned reward head, with and without episodic gating;
+    \item direct RND evaluation, with and without episodic gating;
+    \item the selected hybrid, with and without episodic gating; and
+    \item a head-based control that applies episodic gating using MuZero's
+    latent state instead of the separate observation embeddings.
+\end{itemize}
+
+At fixed checkpoints during each held-out-layout training trial, a frozen copy
+of the current agent will be evaluated for a fixed number of episodes.
+Evaluation episodes do not enter replay and do not update MuZero, the
+exploration model, or the RND predictor. Let
+$0=e_0<\cdots<e_Q=T$ be the evaluation checkpoints, where $T$ is the total
+training-interaction budget on that layout, and let $S_q\in[0,1]$ be the
+fraction of evaluation episodes in which the hidden goal is reached at
+checkpoint $q$. The primary
+behavioral measure is the normalized area under this learning curve:
+\begin{equation}
+    A_{\mathrm{success}}
+      =\frac{1}{T}\sum_{q=0}^{Q-1}
+       \frac{S_q+S_{q+1}}{2}
+       \left(e_{q+1}-e_q\right).
+\end{equation}
+This is the average success rate over the course of training. An agent that
+learns early receives a higher score than one that reaches the same final
+success rate only near the end. This learning-curve score is different from
+the receiver operating characteristic AUC used in the predictive tests.
+Secondary measures are the time to first goal, final success rate, position and
+room coverage, distant dead ends reached, and the fraction of transitions that
+return to a physical pose already visited in the same episode. All methods use
+the same random seeds and test layouts.
+
+The episodic correction should mainly reduce repeated local movement. Direct
+RND evaluation should help only if the exploration model predicts enough of the
+future observation for its RND score to be more accurate than the learned
+head. The selected method must improve goal discovery, not just its own
+prediction metric. A method that avoids necessary backtracking, for example,
+may revisit fewer poses but perform worse on the task.
+
+\section{Decision Rule}
+
+The representation hypothesis is supported if predicted observation embeddings
+identify episodic revisits more accurately than MuZero's latent states at the
+planning depths chosen before final evaluation. Results obtained from true
+future observations and predicted embeddings will be reported separately. This
+separates limitations in observation-based lookup from errors introduced by
+the transition model.
+
+The episodic mechanism is supported if adding only episodic correction reduces
+redundant same-episode revisits without reducing distant coverage or goal
+discovery. Direct RND evaluation is supported if it estimates the actual future
+RND reward more accurately than the intrinsic reward head at prespecified
+planning depths. A behavioral benefit from direct estimation requires the
+direct or hybrid estimator to improve the hidden-goal learning curve over the
+reward head under the same episodic-gating setting. The complete method will
+also be compared with the original ungated, head-based MuZero--RND agent under
+the same interaction and search budgets.
+
+The main comparisons will pair methods by random seed and layout. They will
+report effect sizes and confidence intervals, together with a paired
+randomization or permutation test for the chosen outcomes. If the model
+predicts familiarity accurately but does not improve behavior, familiarity may
+not be the limiting factor, or the signal may need to be integrated differently
+into MCTS. If behavior improves without a corresponding improvement in the
+relevant prediction, the result does not support the proposed mechanism. If
+only the episodic correction works, the conclusion will be limited to
+controlling revisits within an episode. If direct RND is more accurate but does
+not improve behavior, the result supports the estimator but not its use for
+action selection.
+
+\section{Expected Contribution and Risks}
+
+The thesis will establish when observation-grounded predictions provide useful
+exploration signals for MuZero, distinguishing improvements in episodic revisit
+detection, future RND estimation, and exploratory behavior.
+
+The main risks are:
+\begin{itemize}
+    \item \textbf{Prediction outside experience.} The world model may be least
+    accurate exactly where direct RND evaluation is intended to help.
+    Comparing RND on true and predicted future observations will reveal this
+    problem. Development results will determine the hybrid's depth-dependent
+    weights, which will remain fixed during final trials. The direct-only
+    variant will remain a separate experimental condition.
+
+    \item \textbf{Observation similarity may not equal a revisit.} Two
+    physical poses can produce the same image, while irrelevant visual
+    differences can make one pose produce different embeddings. Either
+    error can make episodic gating suppress the wrong action. Revisit labels
+    based on physical pose will measure how often this occurs.
+
+    \item \textbf{Necessary revisits.} Corridors and backtracking make some
+    revisits necessary. Even though episodic gating only reduces an intrinsic
+    bonus, it may still make a required return path less attractive and reduce
+    goal discovery. Coverage and task performance will therefore be evaluated
+    alongside revisit rate.
+
+    \item \textbf{Computational cost.} The additional recurrent model and
+    memory queries make planning slower. Results with equal environment
+    interactions will therefore be accompanied by latency measurements and a
+    second comparison with the same planning-time budget.
+\end{itemize}
+
+\section{Provisional Timeline}
+
+\begin{itemize}
+    \item \textbf{Months 1--2:} implement and validate the Branching Rooms
+    benchmark family and hidden-goal task; verify the existing MuZero--RND
+    baseline with a minimal end-to-end run; and implement the exploration
+    representation and depth-wise prediction tests.
+
+    \item \textbf{Month 3:} measure episodic-memory accuracy and compare
+    head-based with direct future-RND estimates at each prediction depth.
+
+    \item \textbf{Months 4--5:} integrate episodic gating and the validated RND
+    estimators with MCTS, then run the paired behavioral comparisons and
+    ablations.
+
+    \item \textbf{Month 6:} complete the statistical analysis, document
+    failure cases and limitations, and prepare the thesis and reproducibility
+    materials.
+\end{itemize}
+
+\begin{thebibliography}{99}
+
+\bibitem[Schrittwieser et al.(2020)]{muzero}
+J. Schrittwieser et al.
+\newblock Mastering Atari, Go, chess and shogi by planning with a learned model.
+\newblock \emph{Nature}, 588:604--609, 2020.
+
+\bibitem[Grimm et al.(2020)]{value-equivalence}
+C. Grimm, A. Barreto, S. Singh, and D. Silver.
+\newblock The value equivalence principle for model-based reinforcement learning.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 33, 2020.
+
+\bibitem[Osband et al.(2016)]{bootstrapped-dqn}
+I. Osband, C. Blundell, A. Pritzel, and B. Van Roy.
+\newblock Deep exploration via bootstrapped DQN.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 29, 2016.
+
+\bibitem[Burda et al.(2019)]{rnd}
+Y. Burda, H. Edwards, A. Storkey, and O. Klimov.
+\newblock Exploration by random network distillation.
+\newblock In \emph{International Conference on Learning Representations}, 2019.
+
+\bibitem[Walker et al.(2023)]{walker23}
+J. C. Walker, E. V\'{e}rtes, Y. Li, G. Dulac-Arnold, A. Anand,
+T. Weber, and J. B. Hamrick.
+\newblock Investigating the role of model-based learning in exploration and transfer.
+\newblock In \emph{Proceedings of the 40th International Conference on Machine Learning},
+pages 35368--35383, 2023.
+
+\bibitem[Puigdom\`enech Badia et al.(2020b)]{ngu}
+A. Puigdom\`enech Badia et al.
+\newblock Never give up: Learning directed exploration strategies.
+\newblock In \emph{International Conference on Learning Representations}, 2020b.
+
+\bibitem[Puigdom\`enech Badia et al.(2020a)]{agent57}
+A. Puigdom\`enech Badia et al.
+\newblock Agent57: Outperforming the Atari human benchmark.
+\newblock In \emph{Proceedings of the 37th International Conference on Machine Learning}, pages 507--517, 2020a.
+c
+\bibitem[Hafner et al.(2019)]{planet}
+D. Hafner et al.
+\newblock Learning latent dynamics for planning from pixels.
+\newblock In \emph{Proceedings of the 36th International Conference on Machine Learning}, pages 2555--2565, 2019.
+
+\bibitem[Hafner et al.(2020)]{dreamer}
+D. Hafner, T. Lillicrap, J. Ba, and M. Norouzi.
+\newblock Dream to control: Learning behaviors by latent imagination.
+\newblock In \emph{International Conference on Learning Representations}, 2020.
+
+\bibitem[Sekar et al.(2020)]{plan2explore}
+R. Sekar et al.
+\newblock Planning to explore via self-supervised world models.
+\newblock In \emph{Proceedings of the 37th International Conference on Machine Learning}, pages 8583--8592, 2020.
+
+\bibitem[Fu et al.(2023)]{gobi}
+Y. Fu, R. Peng, and H. Lee.
+\newblock Go beyond imagination: Maximizing episodic reachability with world models.
+\newblock In \emph{Proceedings of the 40th International Conference on Machine Learning},
+pages 10405--10420, 2023.
+
+\bibitem[Chevalier-Boisvert et al.(2023)]{minigrid}
+M. Chevalier-Boisvert et al.
+\newblock Minigrid \& Miniworld: Modular \& customizable reinforcement learning environments for goal-oriented tasks.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 36, 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -82,7 +82,9 @@ class InverseScalarTransform:
     def __call__(self, logits: torch.Tensor, epsilon: float = 0.001) -> torch.Tensor:
         if self.categorical_distribution:
             value_probs = torch.softmax(logits, dim=1)
-            value = value_probs.mul_(self.value_support).sum(1, keepdim=True)
+            # Keep the softmax output intact so callers can differentiate a
+            # scalar-value loss through this transform.
+            value = value_probs.mul(self.value_support).sum(1, keepdim=True)
         else:
             value = logits
         tmp = ((torch.sqrt(1 + 4 * epsilon * (torch.abs(value) + 1 + epsilon)) - 1) / (2 * epsilon))

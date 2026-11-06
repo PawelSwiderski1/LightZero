@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Tuple, Union, Optional
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 import wandb
 from ding.model import model_wrap
 from ding.policy.base_policy import Policy
@@ -18,6 +19,171 @@ from lzero.model.utils import calculate_dormant_ratio
 from lzero.policy import scalar_transform, InverseScalarTransform, cross_entropy_loss, phi_transform, \
     DiscreteSupport, to_torch_float_tensor, mz_network_output_unpack, select_action, negative_cosine_similarity, \
     prepare_obs, configure_optimizers
+
+
+def _representation_prediction_parameter_groups(model: torch.nn.Module):
+    """Split MCTS representation/prediction parameters from all other parameters."""
+    representation_prediction_params = []
+    other_params = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        path = f'.{name}.'
+        if '.representation_network.' in path or '.prediction_network.' in path:
+            representation_prediction_params.append(parameter)
+        else:
+            other_params.append(parameter)
+    return representation_prediction_params, other_params
+
+
+def _categorical_value_prior_training_terms(
+        base_logits: torch.Tensor,
+        scalar_prior: torch.Tensor,
+        scalar_target: torch.Tensor,
+        value_support: DiscreteSupport,
+        inverse_scalar_transform,
+        scalar_loss_weight: float,
+):
+    """Build a stable categorical cancellation loss for an additive scalar value prior."""
+    scalar_target = scalar_target.reshape(-1, 1)
+    scalar_prior = scalar_prior.reshape(-1, 1)
+    base_scalar = inverse_scalar_transform(base_logits)
+    final_scalar = base_scalar + scalar_prior
+
+    # The categorical head learns the residual target. Detaching the prior on
+    # this branch prevents gradients through a target distribution, while the
+    # scalar term below provides the intended gradient through the prior input.
+    adjusted_target = scalar_target - scalar_prior.detach()
+    adjusted_target_categorical = phi_transform(
+        value_support,
+        scalar_transform(adjusted_target.squeeze(-1)),
+    )
+    categorical_loss = cross_entropy_loss(base_logits, adjusted_target_categorical)
+    scalar_consistency_loss = F.smooth_l1_loss(
+        scalar_transform(final_scalar),
+        scalar_transform(scalar_target),
+        reduction='none',
+    ).reshape(base_logits.shape[0], -1).mean(dim=1)
+    combined_loss = categorical_loss + float(scalar_loss_weight) * scalar_consistency_loss
+    diagnostics = {
+        'prior': scalar_prior,
+        'adjusted_target': adjusted_target,
+        'base_scalar': base_scalar,
+        'final_scalar': final_scalar,
+        'categorical_loss': categorical_loss,
+        'scalar_consistency_loss': scalar_consistency_loss,
+        'final_abs_error': (final_scalar - scalar_target).abs(),
+    }
+    return final_scalar, combined_loss, diagnostics
+
+
+def _latent_variance_covariance_loss(
+        latent_state: torch.Tensor,
+        group_ids=None,
+        valid_mask: Optional[torch.Tensor] = None,
+        variance_target: float = 1.0,
+        eps: float = 1e-4,
+):
+    """VICReg-style anti-collapse losses, calculated independently per ensemble member."""
+    flat_latent = latent_state.reshape(latent_state.shape[0], -1).float()
+    batch_size, feature_dim = flat_latent.shape
+    if valid_mask is None:
+        valid_mask = torch.ones(batch_size, dtype=torch.bool, device=flat_latent.device)
+    else:
+        valid_mask = torch.as_tensor(valid_mask, device=flat_latent.device).reshape(-1).bool()
+        if valid_mask.numel() != batch_size:
+            raise ValueError(f'Expected {batch_size} latent validity entries, got {valid_mask.numel()}.')
+
+    if group_ids is None:
+        group_ids = [0] * batch_size
+    elif torch.is_tensor(group_ids):
+        group_ids = group_ids.detach().cpu().reshape(-1).tolist()
+    else:
+        group_ids = list(group_ids)
+    if len(group_ids) != batch_size:
+        raise ValueError(f'Expected {batch_size} latent group ids, got {len(group_ids)}.')
+
+    grouped_indices = {}
+    for row_index, group_id in enumerate(group_ids):
+        grouped_indices.setdefault(int(group_id), []).append(row_index)
+
+    variance_losses = []
+    covariance_losses = []
+    std_means = []
+    std_mins = []
+    std_maxes = []
+    covariance_abs_means = []
+    valid_sample_count = 0
+    for indices in grouped_indices.values():
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=flat_latent.device)
+        index_tensor = index_tensor[valid_mask.index_select(0, index_tensor)]
+        if index_tensor.numel() < 2:
+            continue
+        group_latent = flat_latent.index_select(0, index_tensor)
+        centered = group_latent - group_latent.mean(dim=0, keepdim=True)
+        feature_std = torch.sqrt(group_latent.var(dim=0, unbiased=True) + float(eps))
+        covariance = centered.T @ centered / float(group_latent.shape[0] - 1)
+        off_diagonal_mask = ~torch.eye(feature_dim, dtype=torch.bool, device=covariance.device)
+        off_diagonal = covariance[off_diagonal_mask]
+
+        variance_losses.append(torch.relu(float(variance_target) - feature_std).mean())
+        covariance_losses.append(
+            off_diagonal.pow(2).sum() / float(feature_dim) if off_diagonal.numel() > 0 else covariance.sum() * 0.0
+        )
+        std_means.append(feature_std.detach().mean())
+        std_mins.append(feature_std.detach().min())
+        std_maxes.append(feature_std.detach().max())
+        covariance_abs_means.append(
+            off_diagonal.detach().abs().mean()
+            if off_diagonal.numel() > 0
+            else covariance.detach().sum() * 0.0
+        )
+        valid_sample_count += int(group_latent.shape[0])
+
+    zero = flat_latent.sum() * 0.0
+    if not variance_losses:
+        return zero, zero, {
+            'group_count': 0,
+            'sample_count': 0,
+            'feature_std_mean': 0.0,
+            'feature_std_min': 0.0,
+            'feature_std_max': 0.0,
+            'covariance_abs_mean': 0.0,
+        }
+
+    return torch.stack(variance_losses).mean(), torch.stack(covariance_losses).mean(), {
+        'group_count': len(variance_losses),
+        'sample_count': valid_sample_count,
+        'feature_std_mean': float(torch.stack(std_means).mean().item()),
+        'feature_std_min': float(torch.stack(std_mins).mean().item()),
+        'feature_std_max': float(torch.stack(std_maxes).mean().item()),
+        'covariance_abs_mean': float(torch.stack(covariance_abs_means).mean().item()),
+    }
+
+
+def _raw_latent_consistency_terms(
+        predicted_latent: torch.Tensor,
+        target_latent: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Per-sample raw-latent alignment terms with a stop-gradient target branch."""
+    predicted_flat = predicted_latent.reshape(predicted_latent.shape[0], -1).float()
+    target_flat = target_latent.detach().reshape(target_latent.shape[0], -1).float()
+    if predicted_flat.shape != target_flat.shape:
+        raise ValueError(
+            f'Raw latent SSL requires equal latent shapes, got '
+            f'{tuple(predicted_flat.shape)} and {tuple(target_flat.shape)}.'
+        )
+    predicted_l2 = predicted_flat.norm(p=2, dim=1)
+    target_l2 = target_flat.norm(p=2, dim=1)
+    cosine = (predicted_flat * target_flat).sum(dim=1) / (
+        predicted_l2 * target_l2
+    ).clamp_min(1e-8)
+    return {
+        'loss': (predicted_flat - target_flat).pow(2).mean(dim=1),
+        'cosine': cosine,
+        'pred_l2': predicted_l2,
+        'target_l2': target_l2,
+    }
 
 
 @POLICY_REGISTRY.register('muzero')
@@ -154,6 +320,14 @@ class MuZeroPolicy(Policy):
         target_update_freq_for_intrinsic_reward=1000,
         # (float) Weight decay for training policy network.
         weight_decay=1e-4,
+        # Optional weight decay override for the MCTS-facing representation and prediction networks.
+        # ``None`` preserves the global weight decay; set to 0 to exempt these pathways.
+        representation_prediction_weight_decay=None,
+        # VICReg-style anti-collapse regularization on the planning latent. Both weights default to zero.
+        latent_variance_loss_weight=0.0,
+        latent_covariance_loss_weight=0.0,
+        latent_variance_target=1.0,
+        latent_regularization_eps=1e-4,
         # (float) One-order Momentum in optimizer, which stabilizes the training process (gradient direction).
         momentum=0.9,
         # (float) The maximum constraint value of gradient norm clipping.
@@ -180,6 +354,9 @@ class MuZeroPolicy(Policy):
         policy_entropy_weight=0,
         # (float) The weight of ssl (self-supervised learning) loss.
         ssl_loss_weight=0,
+        # (float) Weight of direct MSE between recurrent latents and detached encoded future latents.
+        # Unlike the projected SSL loss, this constrains the exact planning latent used by MCTS.
+        raw_latent_ssl_loss_weight=0.0,
         # (bool) Whether to use piecewise constant learning rate decay.
         # i.e. lr: 0.2 -> 0.02 -> 0.002
         piecewise_decay_lr_scheduler=True,
@@ -210,6 +387,13 @@ class MuZeroPolicy(Policy):
         # (float) The degree of correction to use. A value of 0 means no correction,
         # while a value of 1 means full correction.
         priority_prob_beta=0.4,
+        # (str) Initial PER priority rule for newly collected trajectories.
+        # 'bellman_max' mimics EfficientZero V2 insertion priority: compute collection-time
+        # n-step value Bellman errors from real rewards, then insert the whole trajectory with
+        # max(existing replay priority, max trajectory error). Use 'pred_vs_search' for the
+        # older LightZero behavior based on |V_collection - MCTS_search_value|.
+        priority_initial_mode='bellman_max',
+        priority_new_data_use_max=True,
 
         # ****** UCB ******
         # (float) The alpha value used in the Dirichlet distribution for exploration at the root node of search tree.
@@ -274,21 +458,53 @@ class MuZeroPolicy(Policy):
             Learn mode init method. Called by ``self.__init__``. Initialize the learn model, optimizer and MCTS utils.
         """
         assert self._cfg.optim_type in ['SGD', 'Adam', 'AdamW'], self._cfg.optim_type
+        representation_prediction_weight_decay = self._cfg.get(
+            'representation_prediction_weight_decay', None
+        )
+        if representation_prediction_weight_decay is None:
+            optimizer_parameters = self._model.parameters()
+        else:
+            representation_prediction_params, other_params = _representation_prediction_parameter_groups(self._model)
+            if not representation_prediction_params:
+                raise ValueError(
+                    'representation_prediction_weight_decay was set, but no representation_network or '
+                    'prediction_network parameters were found.'
+                )
+            optimizer_parameters = []
+            if other_params:
+                optimizer_parameters.append(
+                    {'params': other_params, 'weight_decay': float(self._cfg.weight_decay)}
+                )
+            optimizer_parameters.append(
+                {
+                    'params': representation_prediction_params,
+                    'weight_decay': float(representation_prediction_weight_decay),
+                }
+            )
         # NOTE: in board_games, for fixed lr 0.003, 'Adam' is better than 'SGD'.
         if self._cfg.optim_type == 'SGD':
             self._optimizer = optim.SGD(
-                self._model.parameters(),
+                optimizer_parameters,
                 lr=self._cfg.learning_rate,
                 momentum=self._cfg.momentum,
-                weight_decay=self._cfg.weight_decay,
+                weight_decay=0.0 if representation_prediction_weight_decay is not None else self._cfg.weight_decay,
             )
         elif self._cfg.optim_type == 'Adam':
             self._optimizer = optim.Adam(
-                self._model.parameters(), lr=self._cfg.learning_rate, weight_decay=self._cfg.weight_decay
+                optimizer_parameters,
+                lr=self._cfg.learning_rate,
+                weight_decay=0.0 if representation_prediction_weight_decay is not None else self._cfg.weight_decay,
             )
         elif self._cfg.optim_type == 'AdamW':
-            self._optimizer = configure_optimizers(model=self._model, weight_decay=self._cfg.weight_decay,
-                                                   learning_rate=self._cfg.learning_rate, device_type=self._cfg.device)
+            if representation_prediction_weight_decay is None:
+                self._optimizer = configure_optimizers(
+                    model=self._model,
+                    weight_decay=self._cfg.weight_decay,
+                    learning_rate=self._cfg.learning_rate,
+                    device_type=self._cfg.device,
+                )
+            else:
+                self._optimizer = optim.AdamW(optimizer_parameters, lr=self._cfg.learning_rate)
 
         if self._cfg.piecewise_decay_lr_scheduler:
             from torch.optim.lr_scheduler import LambdaLR
@@ -358,6 +574,68 @@ class MuZeroPolicy(Policy):
             # TODO: add the model to wandb
             wandb.watch(self._learn_model.representation_network, log="all")
 
+    def _latent_regularization_group_ids(self, batch_size: int):
+        active_member_ids = getattr(self._learn_model, 'active_member_id', None)
+        if torch.is_tensor(active_member_ids):
+            active_member_ids = active_member_ids.detach().cpu().reshape(-1).tolist()
+        if isinstance(active_member_ids, (list, tuple)):
+            if len(active_member_ids) != batch_size:
+                raise ValueError(
+                    f'Expected {batch_size} active member ids for latent regularization, '
+                    f'got {len(active_member_ids)}.'
+                )
+            return list(active_member_ids)
+        return None
+
+    def _value_training_prediction_and_loss(
+            self,
+            value_logits: torch.Tensor,
+            latent_state: torch.Tensor,
+            scalar_target: torch.Tensor,
+            categorical_target: torch.Tensor,
+    ):
+        base_scalar = self.value_inverse_scalar_transform_handle(value_logits)
+        prior_scale = float(self._cfg.model.get('random_prior_scale', 0.0))
+        if prior_scale <= 0.0:
+            return base_scalar, cross_entropy_loss(value_logits, categorical_target), None
+        if not bool(self._cfg.model.get('categorical_distribution', True)):
+            raise NotImplementedError(
+                'The additive value-prior training loss currently requires categorical value predictions.'
+            )
+        if not hasattr(self._learn_model, 'value_prior_from_latent'):
+            raise RuntimeError(
+                'random_prior_scale is enabled, but the model does not expose value_prior_from_latent().'
+            )
+        scalar_prior = self._learn_model.value_prior_from_latent(latent_state)
+        if scalar_prior is None:
+            raise RuntimeError('random_prior_scale is enabled, but the model has no value-prior networks.')
+        scalar_loss_weight = float(
+            self._cfg.model.get('value_prior_scalar_loss_weight', 1.0)
+        )
+        return _categorical_value_prior_training_terms(
+            value_logits,
+            scalar_prior,
+            scalar_target,
+            self.value_support,
+            self.value_inverse_scalar_transform_handle,
+            scalar_loss_weight,
+        )
+
+    def _replay_auxiliary_loss(
+            self,
+            data,
+            obs_batch_ori,
+            mask_batch: torch.Tensor,
+            weights: torch.Tensor,
+            latent_states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Return an optional loss evaluated on the primary MuZero unroll."""
+        return latent_states[0].sum() * 0.0, {}
+
+    def _after_replay_auxiliary_backward(self) -> Dict[str, float]:
+        """Synchronize or clip parameters owned by a replay auxiliary loss."""
+        return {}
+
     def _forward_learn(self, data: Tuple[torch.Tensor]) -> Dict[str, Union[float, int]]:
         """
         Overview:
@@ -380,12 +658,20 @@ class MuZeroPolicy(Policy):
         obs_batch_ori, action_batch, mask_batch, indices, weights, make_time = current_batch
         target_reward, target_value, target_policy = target_batch
 
+        projected_ssl_enabled = (
+            bool(self._cfg.model.self_supervised_learning_loss)
+            and float(self._cfg.ssl_loss_weight) > 0.0
+        )
+        raw_latent_ssl_weight = float(self._cfg.get('raw_latent_ssl_loss_weight', 0.0))
+        raw_latent_ssl_enabled = raw_latent_ssl_weight > 0.0
         obs_batch, obs_target_batch = prepare_obs(obs_batch_ori, self._cfg)
+        if (projected_ssl_enabled or raw_latent_ssl_enabled) and obs_target_batch is None:
+            raise ValueError('Future observations are required when a latent SSL loss is enabled.')
 
         # do augmentations
         if self._cfg.use_augmentation:
             obs_batch = self.image_transforms.transform(obs_batch)
-            if self._cfg.model.self_supervised_learning_loss:
+            if projected_ssl_enabled or raw_latent_ssl_enabled:
                 obs_target_batch = self.image_transforms.transform(obs_target_batch)
 
         # shape: (batch_size, num_unroll_steps, action_dim)
@@ -411,6 +697,7 @@ class MuZeroPolicy(Policy):
         # represented as the linear combination of its two adjacent supports.
         target_reward_categorical = phi_transform(self.reward_support, transformed_target_reward)
         target_value_categorical = phi_transform(self.value_support, transformed_target_value)
+        value_prior_training_records = []
 
         # ==============================================================
         # the core initial_inference in MuZero policy.
@@ -419,6 +706,29 @@ class MuZeroPolicy(Policy):
 
         # value_prefix shape: (batch_size, 10), the ``value_prefix`` at the first step is zero padding.
         latent_state, reward, value, policy_logits = mz_network_output_unpack(network_output)
+        replay_latent_states = [latent_state]
+
+        latent_regularization_enabled = (
+            float(self._cfg.get('latent_variance_loss_weight', 0.0)) > 0.0
+            or float(self._cfg.get('latent_covariance_loss_weight', 0.0)) > 0.0
+        )
+        latent_regularization_records = {'root': [], 'dynamics': [], 'target': []}
+        latent_group_ids = self._latent_regularization_group_ids(int(latent_state.shape[0]))
+
+        def record_latent_regularization(source: str, state: torch.Tensor, valid_mask=None) -> None:
+            if not latent_regularization_enabled:
+                return
+            variance_loss, covariance_loss, stats = _latent_variance_covariance_loss(
+                state,
+                group_ids=latent_group_ids,
+                valid_mask=valid_mask,
+                variance_target=float(self._cfg.get('latent_variance_target', 1.0)),
+                eps=float(self._cfg.get('latent_regularization_eps', 1e-4)),
+            )
+            if stats['group_count'] > 0:
+                latent_regularization_records[source].append((variance_loss, covariance_loss, stats))
+
+        record_latent_regularization('root', latent_state)
 
         # ========= logging for analysis =========
         # calculate dormant ratio of encoder
@@ -429,9 +739,15 @@ class MuZeroPolicy(Policy):
         latent_state_l2_norms = torch.norm(latent_state.view(latent_state.shape[0], -1), p=2, dim=1).mean()
         # ========= logging for analysis ===============
 
-        # transform the scaled value or its categorical representation to its original value,
-        # i.e. h^(-1)(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
-        original_value = self.value_inverse_scalar_transform_handle(value)
+        original_value, value_loss, value_prior_record = self._value_training_prediction_and_loss(
+            value,
+            latent_state,
+            target_value[:, 0],
+            target_value_categorical[:, 0],
+        )
+        if value_prior_record is not None:
+            value_prior_training_records.append(value_prior_record)
+        root_predicted_value = original_value.squeeze(-1).detach().cpu().numpy()
 
         # Note: The following lines are just for debugging.
         predicted_rewards = []
@@ -448,7 +764,6 @@ class MuZeroPolicy(Policy):
         # calculate policy and value loss for the first step.
         # ==============================================================
         policy_loss = cross_entropy_loss(policy_logits, target_policy[:, 0])
-        value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
 
         prob = torch.softmax(policy_logits, dim=-1)
         entropy = -(prob * prob.log()).sum(-1)
@@ -456,6 +771,8 @@ class MuZeroPolicy(Policy):
 
         reward_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
         consistency_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
+        raw_latent_consistency_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
+        raw_latent_consistency_records = []
         target_policy_entropy = 0
 
         # ==============================================================
@@ -467,6 +784,8 @@ class MuZeroPolicy(Policy):
             # And then predict policy_logits and value with the prediction function.
             network_output = self._learn_model.recurrent_inference(latent_state, action_batch[:, step_k])
             latent_state, reward, value, policy_logits = mz_network_output_unpack(network_output)
+            replay_latent_states.append(latent_state)
+            record_latent_regularization('dynamics', latent_state, mask_batch[:, step_k])
 
             # ========= logging for analysis ===============
             if step_k == self._cfg.num_unroll_steps - 1 and self._cfg.calculate_dormant_ratio:
@@ -490,27 +809,44 @@ class MuZeroPolicy(Policy):
                                                                 percentage=self._cfg.dormant_threshold)
             # ========= logging for analysis ===============
 
-            # transform the scaled value or its categorical representation to its original value,
-            # i.e. h^(-1)(.) function in paper https://arxiv.org/pdf/1805.11593.pdf.
-            original_value = self.value_inverse_scalar_transform_handle(value)
+            original_value, step_value_loss, value_prior_record = self._value_training_prediction_and_loss(
+                value,
+                latent_state,
+                target_value[:, step_k + 1],
+                target_value_categorical[:, step_k + 1],
+            )
+            if value_prior_record is not None:
+                value_prior_training_records.append(value_prior_record)
 
-            if self._cfg.model.self_supervised_learning_loss:
+            if projected_ssl_enabled or raw_latent_ssl_enabled:
                 # ==============================================================
                 # calculate consistency loss for the next ``num_unroll_steps`` unroll steps.
                 # ==============================================================
-                if self._cfg.ssl_loss_weight > 0:
-                    # obtain the oracle latent states from representation function.
-                    beg_index, end_index = self._get_target_obs_index_in_step_k(step_k)
-                    network_output = self._learn_model.initial_inference(obs_target_batch[:, beg_index:end_index])
+                # Obtain the oracle latent state once for both projected and raw SSL.
+                beg_index, end_index = self._get_target_obs_index_in_step_k(step_k)
+                target_network_output = self._learn_model.initial_inference(
+                    obs_target_batch[:, beg_index:end_index]
+                )
+                latent_state = to_tensor(latent_state)
+                representation_state = to_tensor(target_network_output.latent_state)
+                record_latent_regularization('target', representation_state, mask_batch[:, step_k])
 
-                    latent_state = to_tensor(latent_state)
-                    representation_state = to_tensor(network_output.latent_state)
-
+                if projected_ssl_enabled:
                     # NOTE: no grad for the representation_state branch
                     dynamic_proj = self._learn_model.project(latent_state, with_grad=True)
                     observation_proj = self._learn_model.project(representation_state, with_grad=False)
                     temp_loss = negative_cosine_similarity(dynamic_proj, observation_proj) * mask_batch[:, step_k]
                     consistency_loss += temp_loss
+
+                if raw_latent_ssl_enabled:
+                    raw_terms = _raw_latent_consistency_terms(latent_state, representation_state)
+                    step_mask = mask_batch[:, step_k]
+                    raw_latent_consistency_loss += raw_terms['loss'] * step_mask
+                    raw_record = {
+                        key: value.detach() for key, value in raw_terms.items()
+                    }
+                    raw_record['mask'] = step_mask.detach()
+                    raw_latent_consistency_records.append(raw_record)
 
             # NOTE: the target policy is calculated in game buffer now.
             # ==============================================================
@@ -539,7 +875,7 @@ class MuZeroPolicy(Policy):
                 # Set target_policy_entropy to log(|A|) if all rows are masked
                 target_policy_entropy += torch.log(torch.tensor(target_normalized_visit_count.shape[-1]))
 
-            value_loss += cross_entropy_loss(value, target_value_categorical[:, step_k + 1])
+            value_loss += step_value_loss
             reward_loss += cross_entropy_loss(reward, target_reward_categorical[:, step_k])
 
             if self._cfg.monitor_extra_statistics:
@@ -547,10 +883,93 @@ class MuZeroPolicy(Policy):
                 original_rewards_cpu = original_rewards.detach().cpu()
 
                 predicted_values = torch.cat(
-                    (predicted_values, self.value_inverse_scalar_transform_handle(value).detach().cpu())
+                    (predicted_values, original_value.detach().cpu())
                 )
                 predicted_rewards.append(original_rewards_cpu)
                 predicted_policies = torch.cat((predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
+
+        latent_regularization_log = {}
+        all_latent_regularization_records = [
+            record
+            for source_records in latent_regularization_records.values()
+            for record in source_records
+        ]
+        if all_latent_regularization_records:
+            latent_variance_loss = torch.stack(
+                [record[0] for record in all_latent_regularization_records]
+            ).mean()
+            latent_covariance_loss = torch.stack(
+                [record[1] for record in all_latent_regularization_records]
+            ).mean()
+            for source, source_records in latent_regularization_records.items():
+                if not source_records:
+                    continue
+                latent_regularization_log.update({
+                    f'latent_regularization/{source}_variance_loss': float(
+                        torch.stack([record[0].detach() for record in source_records]).mean().item()
+                    ),
+                    f'latent_regularization/{source}_covariance_loss': float(
+                        torch.stack([record[1].detach() for record in source_records]).mean().item()
+                    ),
+                    f'latent_regularization/{source}_feature_std_mean': float(
+                        np.mean([record[2]['feature_std_mean'] for record in source_records])
+                    ),
+                    f'latent_regularization/{source}_feature_std_min': float(
+                        np.mean([record[2]['feature_std_min'] for record in source_records])
+                    ),
+                    f'latent_regularization/{source}_feature_std_max': float(
+                        np.mean([record[2]['feature_std_max'] for record in source_records])
+                    ),
+                    f'latent_regularization/{source}_covariance_abs_mean': float(
+                        np.mean([record[2]['covariance_abs_mean'] for record in source_records])
+                    ),
+                })
+        else:
+            latent_variance_loss = latent_state.sum() * 0.0
+            latent_covariance_loss = latent_state.sum() * 0.0
+
+        weighted_latent_variance_loss = (
+            float(self._cfg.get('latent_variance_loss_weight', 0.0)) * latent_variance_loss
+        )
+        weighted_latent_covariance_loss = (
+            float(self._cfg.get('latent_covariance_loss_weight', 0.0)) * latent_covariance_loss
+        )
+
+        raw_latent_consistency_log = {}
+        if raw_latent_consistency_records:
+            valid_count = torch.stack([
+                record['mask'].sum() for record in raw_latent_consistency_records
+            ]).sum()
+            valid_denominator = valid_count.clamp_min(1.0)
+
+            def raw_valid_mean(name: str) -> torch.Tensor:
+                return torch.stack([
+                    (record[name] * record['mask']).sum()
+                    for record in raw_latent_consistency_records
+                ]).sum() / valid_denominator
+
+            raw_loss_mean = raw_valid_mean('loss')
+            raw_latent_consistency_log.update({
+                'raw_latent_ssl/loss': float(raw_loss_mean.item()),
+                'raw_latent_ssl/weighted_loss': float(
+                    (raw_latent_ssl_weight * raw_loss_mean).item()
+                ),
+                'raw_latent_ssl/cosine': float(raw_valid_mean('cosine').item()),
+                'raw_latent_ssl/pred_l2_mean': float(raw_valid_mean('pred_l2').item()),
+                'raw_latent_ssl/target_l2_mean': float(raw_valid_mean('target_l2').item()),
+                'raw_latent_ssl/valid_step_fraction': float(
+                    valid_count.item()
+                    / max(1, self._cfg.batch_size * self._cfg.num_unroll_steps)
+                ),
+            })
+            for depth, record in enumerate(raw_latent_consistency_records, start=1):
+                depth_count = record['mask'].sum().clamp_min(1.0)
+                raw_latent_consistency_log[f'raw_latent_ssl/depth_{depth}_loss'] = float(
+                    ((record['loss'] * record['mask']).sum() / depth_count).item()
+                )
+                raw_latent_consistency_log[f'raw_latent_ssl/depth_{depth}_cosine'] = float(
+                    ((record['cosine'] * record['mask']).sum() / depth_count).item()
+                )
 
         # ==============================================================
         # the core learn model update step.
@@ -563,6 +982,7 @@ class MuZeroPolicy(Policy):
         if self._cfg.model.harmony_balance:
             loss = (
                   (consistency_loss.mean() * self._cfg.ssl_loss_weight)
+                + (raw_latent_consistency_loss.mean() * raw_latent_ssl_weight)
                 + (policy_loss.mean() / torch.exp(self.harmony_policy))
                 + (value_loss.mean() / torch.exp(self.harmony_value)) 
                 + (reward_loss.mean() / torch.exp(self.harmony_reward))
@@ -577,12 +997,86 @@ class MuZeroPolicy(Policy):
             loss = (
                     self._cfg.ssl_loss_weight * consistency_loss + self._cfg.policy_loss_weight * policy_loss +
                     self._cfg.value_loss_weight * value_loss + self._cfg.reward_loss_weight * reward_loss +
-                    self._cfg.policy_entropy_weight * policy_entropy_loss
+                    self._cfg.policy_entropy_weight * policy_entropy_loss +
+                    raw_latent_ssl_weight * raw_latent_consistency_loss
             )
             weighted_total_loss = (weights * loss).mean()
+        weighted_muzero_loss = weighted_total_loss
+        weighted_total_loss = (
+            weighted_muzero_loss + weighted_latent_variance_loss + weighted_latent_covariance_loss
+        )
+        auxiliary_replay_loss, auxiliary_replay_log = self._replay_auxiliary_loss(
+            data,
+            obs_batch_ori,
+            mask_batch,
+            weights,
+            replay_latent_states,
+        )
+        if auxiliary_replay_loss.dim() != 0:
+            raise ValueError(
+                "Replay auxiliary loss must be scalar, got shape "
+                f"{tuple(auxiliary_replay_loss.shape)}."
+            )
+        weighted_total_loss = weighted_total_loss + auxiliary_replay_loss
 
         gradient_scale = 1 / self._cfg.num_unroll_steps
-        weighted_total_loss.register_hook(lambda grad: grad * gradient_scale)
+        prediction_gradient_log = {}
+        prediction_weight_parameters = []
+        if bool(self._cfg.get('prediction_gradient_diagnostics', False)):
+            prediction_weight_parameters = [
+                parameter
+                for name, parameter in self._learn_model.named_parameters()
+                if name.endswith('prediction_network.fc_prediction_common.0.weight')
+            ]
+            if prediction_weight_parameters:
+                if self._cfg.model.harmony_balance:
+                    value_objective = value_loss.mean() / torch.exp(self.harmony_value)
+                    policy_objective = policy_loss.mean() / torch.exp(self.harmony_policy)
+                else:
+                    value_objective = (
+                        weights * self._cfg.value_loss_weight * value_loss
+                    ).mean()
+                    policy_objective = (
+                        weights * self._cfg.policy_loss_weight * policy_loss
+                    ).mean()
+                value_gradients = torch.autograd.grad(
+                    value_objective,
+                    prediction_weight_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                policy_gradients = torch.autograd.grad(
+                    policy_objective,
+                    prediction_weight_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                value_gradient_norms = [
+                    0.0 if gradient is None else float((gradient * gradient_scale).norm().item())
+                    for gradient in value_gradients
+                ]
+                policy_gradient_norms = [
+                    0.0 if gradient is None else float((gradient * gradient_scale).norm().item())
+                    for gradient in policy_gradients
+                ]
+                prediction_gradient_log['prediction_trunk/value_grad_norm_mean'] = float(
+                    np.mean(value_gradient_norms)
+                )
+                prediction_gradient_log['prediction_trunk/policy_grad_norm_mean'] = float(
+                    np.mean(policy_gradient_norms)
+                )
+                for member_id, gradient_norm in enumerate(value_gradient_norms):
+                    prediction_gradient_log[
+                        f'prediction_trunk/member_{member_id}_value_grad_norm'
+                    ] = float(gradient_norm)
+                for member_id, gradient_norm in enumerate(policy_gradient_norms):
+                    prediction_gradient_log[
+                        f'prediction_trunk/member_{member_id}_policy_grad_norm'
+                    ] = float(gradient_norm)
+
+        # Preserve LightZero's historical unroll scaling for MuZero losses, while
+        # keeping the explicit latent-regularization coefficients literal.
+        weighted_muzero_loss.register_hook(lambda grad: grad * gradient_scale)
         self._optimizer.zero_grad()
         weighted_total_loss.backward()
 
@@ -600,7 +1094,15 @@ class MuZeroPolicy(Policy):
             self.sync_gradients(self._learn_model)
         total_grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(self._learn_model.parameters(),
                                                                      self._cfg.grad_clip_value)
+        auxiliary_gradient_log = self._after_replay_auxiliary_backward()
         self._optimizer.step()
+        if prediction_weight_parameters:
+            weight_norms = [float(parameter.detach().norm().item()) for parameter in prediction_weight_parameters]
+            prediction_gradient_log['prediction_trunk/first_weight_norm_mean'] = float(np.mean(weight_norms))
+            for member_id, weight_norm in enumerate(weight_norms):
+                prediction_gradient_log[
+                    f'prediction_trunk/member_{member_id}_first_weight_norm'
+                ] = float(weight_norm)
         if self._cfg.piecewise_decay_lr_scheduler:
             self.lr_scheduler.step()
 
@@ -615,12 +1117,37 @@ class MuZeroPolicy(Policy):
             predicted_rewards = torch.stack(predicted_rewards).transpose(1, 0).squeeze(-1)
             predicted_rewards = predicted_rewards.reshape(-1).unsqueeze(-1)
 
+        value_prior_training_log = {}
+        if value_prior_training_records:
+            def record_mean(name: str) -> float:
+                values = torch.cat(
+                    [record[name].detach().reshape(-1) for record in value_prior_training_records]
+                )
+                return float(values.mean().item())
+
+            priors = torch.cat(
+                [record['prior'].detach().reshape(-1) for record in value_prior_training_records]
+            )
+            value_prior_training_log = {
+                'value_prior/prior_mean': float(priors.mean().item()),
+                'value_prior/prior_std': float(priors.std(unbiased=False).item()),
+                'value_prior/base_prediction_mean': record_mean('base_scalar'),
+                'value_prior/final_prediction_mean': record_mean('final_scalar'),
+                'value_prior/adjusted_target_mean': record_mean('adjusted_target'),
+                'value_prior/categorical_loss': record_mean('categorical_loss'),
+                'value_prior/scalar_consistency_loss': record_mean('scalar_consistency_loss'),
+                'value_prior/final_prediction_mae': record_mean('final_abs_error'),
+            }
+
         return_log_dict = {
             'collect_mcts_temperature': self._collect_mcts_temperature,
             'collect_epsilon': self.collect_epsilon,
             'cur_lr': self._optimizer.param_groups[0]['lr'],
             'weighted_total_loss': weighted_total_loss.item(),
-            'total_loss': loss.mean().item(),
+            'total_loss': (
+                loss.mean() + weighted_latent_variance_loss + weighted_latent_covariance_loss
+                + auxiliary_replay_loss
+            ).item(),
             'policy_loss': policy_loss.mean().item(),
             'policy_entropy': - policy_entropy_loss.mean().item() / (self._cfg.num_unroll_steps + 1),
             'target_policy_entropy': target_policy_entropy.item() / (self._cfg.num_unroll_steps + 1),
@@ -633,7 +1160,22 @@ class MuZeroPolicy(Policy):
             'transformed_target_value': transformed_target_value.mean().item(),
             'predicted_rewards': predicted_rewards.mean().item(),
             'predicted_values': predicted_values.mean().item(),
+            'root_predicted_value': float(np.mean(root_predicted_value)),
+            'root_predicted_value_orig': root_predicted_value,
             'total_grad_norm_before_clip': total_grad_norm_before_clip.item(),
+            'latent_regularization/variance_loss': float(latent_variance_loss.detach().item()),
+            'latent_regularization/covariance_loss': float(latent_covariance_loss.detach().item()),
+            'latent_regularization/weighted_variance_loss': float(
+                weighted_latent_variance_loss.detach().item()
+            ),
+            'latent_regularization/weighted_covariance_loss': float(
+                weighted_latent_covariance_loss.detach().item()
+            ),
+            'optimizer/representation_prediction_weight_decay': float(
+                self._cfg.weight_decay
+                if self._cfg.get('representation_prediction_weight_decay', None) is None
+                else self._cfg.representation_prediction_weight_decay
+            ),
             # ==============================================================
             # priority related
             # ==============================================================
@@ -648,6 +1190,12 @@ class MuZeroPolicy(Policy):
             'analysis/grad_norm_before': self.grad_norm_before,
             'analysis/grad_norm_after': self.grad_norm_after,
         }
+        return_log_dict.update(latent_regularization_log)
+        return_log_dict.update(raw_latent_consistency_log)
+        return_log_dict.update(prediction_gradient_log)
+        return_log_dict.update(value_prior_training_log)
+        return_log_dict.update(auxiliary_replay_log)
+        return_log_dict.update(auxiliary_gradient_log)
         
         # ["harmony_dynamics", "harmony_policy", "harmony_value", "harmony_reward", "harmony_entropy"]
         if self._cfg.model.harmony_balance:
@@ -1006,6 +1554,49 @@ class MuZeroPolicy(Policy):
             'transformed_target_value',
             'total_grad_norm_before_clip',
         ]
+        if (
+                float(self._cfg.get('latent_variance_loss_weight', 0.0)) > 0.0
+                or float(self._cfg.get('latent_covariance_loss_weight', 0.0)) > 0.0
+        ):
+            return_list.extend([
+                'latent_regularization/variance_loss',
+                'latent_regularization/covariance_loss',
+                'latent_regularization/weighted_variance_loss',
+                'latent_regularization/weighted_covariance_loss',
+                'latent_regularization/root_variance_loss',
+                'latent_regularization/root_covariance_loss',
+                'latent_regularization/root_feature_std_mean',
+                'latent_regularization/root_feature_std_min',
+                'latent_regularization/root_feature_std_max',
+                'latent_regularization/root_covariance_abs_mean',
+                'latent_regularization/dynamics_variance_loss',
+                'latent_regularization/dynamics_covariance_loss',
+                'latent_regularization/dynamics_feature_std_mean',
+                'latent_regularization/dynamics_feature_std_min',
+                'latent_regularization/dynamics_feature_std_max',
+                'latent_regularization/dynamics_covariance_abs_mean',
+                'latent_regularization/target_variance_loss',
+                'latent_regularization/target_covariance_loss',
+                'latent_regularization/target_feature_std_mean',
+                'latent_regularization/target_feature_std_min',
+                'latent_regularization/target_feature_std_max',
+                'latent_regularization/target_covariance_abs_mean',
+                'optimizer/representation_prediction_weight_decay',
+            ])
+        if float(self._cfg.get('raw_latent_ssl_loss_weight', 0.0)) > 0.0:
+            return_list.extend([
+                'raw_latent_ssl/loss',
+                'raw_latent_ssl/weighted_loss',
+                'raw_latent_ssl/cosine',
+                'raw_latent_ssl/pred_l2_mean',
+                'raw_latent_ssl/target_l2_mean',
+                'raw_latent_ssl/valid_step_fraction',
+            ])
+            for depth in range(1, int(self._cfg.num_unroll_steps) + 1):
+                return_list.extend([
+                    f'raw_latent_ssl/depth_{depth}_loss',
+                    f'raw_latent_ssl/depth_{depth}_cosine',
+                ])
         # ["harmony_dynamics", "harmony_policy", "harmony_value", "harmony_reward", "harmony_entropy"]
         if self._cfg.model.harmony_balance:
             harmony_list = [
@@ -1016,6 +1607,30 @@ class MuZeroPolicy(Policy):
                 'harmony_entropy', 'harmony_entropy_exp_recip',
             ]
             return_list.extend(harmony_list)
+        if bool(self._cfg.get('prediction_gradient_diagnostics', False)):
+            return_list.extend([
+                'prediction_trunk/first_weight_norm_mean',
+                'prediction_trunk/value_grad_norm_mean',
+                'prediction_trunk/policy_grad_norm_mean',
+            ])
+            ensemble_size = int(self._cfg.model.get('ensemble_size', 1))
+            for member_id in range(ensemble_size):
+                return_list.extend([
+                    f'prediction_trunk/member_{member_id}_first_weight_norm',
+                    f'prediction_trunk/member_{member_id}_value_grad_norm',
+                    f'prediction_trunk/member_{member_id}_policy_grad_norm',
+                ])
+        if float(self._cfg.model.get('random_prior_scale', 0.0)) > 0.0:
+            return_list.extend([
+                'value_prior/prior_mean',
+                'value_prior/prior_std',
+                'value_prior/base_prediction_mean',
+                'value_prior/final_prediction_mean',
+                'value_prior/adjusted_target_mean',
+                'value_prior/categorical_loss',
+                'value_prior/scalar_consistency_loss',
+                'value_prior/final_prediction_mae',
+            ])
         return return_list
 
     def _state_dict_learn(self) -> Dict[str, Any]:
@@ -1043,10 +1658,16 @@ class MuZeroPolicy(Policy):
         self._optimizer.load_state_dict(state_dict['optimizer'])
 
     def __del__(self):
-        if self._cfg.model.analysis_sim_norm:
-            # Remove hooks after training.
-            self._collect_model.encoder_hook.remove_hooks()
-            self._target_model.encoder_hook.remove_hooks()
+        cfg = getattr(self, '_cfg', None)
+        model_cfg = getattr(cfg, 'model', {})
+        if not bool(model_cfg.get('analysis_sim_norm', False)):
+            return
+        # Remove hooks after training.
+        for model_name in ('_collect_model', '_target_model'):
+            model = getattr(self, model_name, None)
+            encoder_hook = getattr(model, 'encoder_hook', None)
+            if encoder_hook is not None:
+                encoder_hook.remove_hooks()
 
     def _process_transition(self, obs, policy_output, timestep):
         # be compatible with DI-engine Policy class
@@ -1055,4 +1676,3 @@ class MuZeroPolicy(Policy):
     def _get_train_sample(self, data):
         # be compatible with DI-engine Policy class
         pass
-

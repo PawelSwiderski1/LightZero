@@ -36,6 +36,28 @@ class GameBuffer(ABC, object):
         reanalyze_outdated=True,
         # (bool) Whether to use the root value in the reanalyzing part. Please refer to EfficientZero paper for details.
         use_root_value=False,
+        # (bool) Whether MuZero value targets should bootstrap from fresh MCTS searched values instead of raw target-network values.
+        reanalyze_use_search_value_target=False,
+        # (str) Value target construction mode. 'auto' preserves legacy behavior:
+        # normal TD targets unless use_root_value/reanalyze_use_search_value_target is enabled.
+        # 'mixed_sve' uses Search-Based Value Estimation for stale samples after a warmup.
+        value_target_mode='auto',
+        # (int) Learner iteration before which mixed_sve falls back to TD targets.
+        sve_start_train_iter=0,
+        # (int) Number of most recent replay transitions treated as fresh by mixed_sve.
+        sve_recent_window=0,
+        # (int) Number of real replay rewards retained before the MCTS bootstrap for stale mixed-SVE samples.
+        # Zero preserves the direct EfficientZero-V2-style SVE target at the sampled root.
+        sve_real_reward_prefix_steps=0,
+        # (bool) Whether mixed-SVE value searches add root Dirichlet noise. This is
+        # intentionally independent from policy reanalysis noise.
+        sve_search_noise=False,
+        # (bool) For ensemble models, build per-member TD bootstrap targets so member k is trained
+        # against member k's own target-network bootstrap rather than member 0's bootstrap.
+        ensemble_member_bootstrap_targets=False,
+        # (bool) Bootstrap from the final observation when an episode ends only because of a time limit.
+        # Disable this for finite-horizon tasks whose time limit is part of the objective.
+        bootstrap_at_time_limit=True,
         # (int) The number of samples required for mini inference.
         mini_infer_size=10240,
         # (str) The type of sampled data. The default is 'transition'. Options: 'transition', 'episode'.
@@ -228,10 +250,10 @@ class GameBuffer(ABC, object):
             pos_in_game_segment_list.append(pos_in_game_segment)
             
 
-        # make_time = [time.time() for _ in range(len(batch_index_list))]
-
-        # Set the make_time for each sample (set to 0 for now, but can be the actual time if needed).
-        make_time = [0. for _ in range(len(batch_index_list))]
+        # Priority updates use this timestamp to reject batches sampled before a
+        # replay-buffer eviction changed the index mapping.
+        sample_time = time.time()
+        make_time = [sample_time for _ in range(len(batch_index_list))]
 
         orig_data = (game_segment_list, pos_in_game_segment_list, batch_index_list, weights_list, make_time)
         
@@ -676,6 +698,10 @@ class GameBuffer(ABC, object):
             assert data_length == len(meta['priorities']), " priorities should be of same length as the game steps"
             priorities = meta['priorities'].copy().reshape(-1)
             priorities[valid_len:data_length] = 0.
+            if getattr(self._cfg, 'priority_new_data_use_max', True) and valid_len > 0:
+                max_existing_prio = self.game_pos_priorities.max() if len(self.game_pos_priorities) > 0 else 1
+                max_new_prio = priorities[:valid_len].max() if len(priorities[:valid_len]) > 0 else 1
+                priorities[:valid_len] = max(float(max_existing_prio), float(max_new_prio))
             self.game_pos_priorities = np.concatenate((self.game_pos_priorities, priorities))
 
         self.game_segment_buffer.append(data)
@@ -740,6 +766,27 @@ class GameBuffer(ABC, object):
     def get_num_of_transitions(self) -> int:
         # total number of transitions
         return len(self.game_segment_game_pos_look_up)
+
+    def sample_observations_uniform(self, sample_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Uniformly sample real replay observations, independently of PER priorities."""
+        from lzero.mcts.utils import prepare_observation
+
+        transition_count = self.get_num_of_transitions()
+        sample_size = min(max(0, int(sample_size)), transition_count)
+        if sample_size == 0:
+            return np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.int64)
+
+        replay_indices = np.random.choice(transition_count, sample_size, replace=False)
+        observations = []
+        for replay_index in replay_indices:
+            game_segment_idx, pos_in_game_segment = self.game_segment_game_pos_look_up[int(replay_index)]
+            game_segment = self.game_segment_buffer[game_segment_idx - self.base_idx]
+            observations.append(
+                game_segment.get_unroll_obs(int(pos_in_game_segment), num_unroll_steps=0, padding=True)
+            )
+
+        observations = prepare_observation(observations, self._cfg.model.model_type)
+        return np.asarray(observations), replay_indices.astype(np.int64)
 
     def __repr__(self):
         return f'current buffer statistics is: num_of_all_collected_episodes: {self.num_of_collected_episodes}, num of game segments: {len(self.game_segment_buffer)}, number of transitions: {len(self.game_segment_game_pos_look_up)}'

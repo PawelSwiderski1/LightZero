@@ -239,6 +239,10 @@ class MuZeroEvaluator(ISerialEvaluator):
             eval_monitor = VectorEvalMonitor(self._env.env_num, n_episode)
             env_nums = self._env.env_num
 
+            def env_has_eval_quota(env_id: int) -> bool:
+                rewards = eval_monitor._reward[env_id]
+                return len(rewards) < rewards.maxlen
+
             self._env.reset()
             self._policy.reset(task_id=self.task_id)
 
@@ -279,6 +283,7 @@ class MuZeroEvaluator(ISerialEvaluator):
             ready_env_id = set()
             remain_episode = n_episode
             eps_steps_lst = np.zeros(env_nums)
+            ensemble_eval_root_diagnostics = []
             with self._timer:
                 while not eval_monitor.is_finished():
                     # Check if a timeout has occurred.
@@ -289,9 +294,17 @@ class MuZeroEvaluator(ISerialEvaluator):
 
                     # Get observations from ready environments.
                     obs = self._env.ready_obs
-                    new_available_env_id = set(obs.keys()).difference(ready_env_id)
-                    ready_env_id = ready_env_id.union(set(list(new_available_env_id)[:remain_episode]))
-                    remain_episode -= min(len(new_available_env_id), remain_episode)
+                    new_available_env_id = [
+                        env_id for env_id in sorted(set(obs.keys()).difference(ready_env_id))
+                        if env_has_eval_quota(env_id)
+                    ]
+                    scheduled_env_id = new_available_env_id[:remain_episode]
+                    ready_env_id = ready_env_id.union(set(scheduled_env_id))
+                    remain_episode -= len(scheduled_env_id)
+
+                    if len(ready_env_id) == 0:
+                        time.sleep(retry_waiting_time)
+                        continue
 
                     # Prepare stacked observations and other inputs for the policy.
                     stack_obs = {env_id: game_segments[env_id].get_obs() for env_id in ready_env_id}
@@ -309,7 +322,9 @@ class MuZeroEvaluator(ISerialEvaluator):
                     # ==============================================================
                     if self.task_id is None:
                         # Single-task setting
-                        policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep)
+                        policy_output = self._policy.forward(
+                            stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep
+                        )
                     else:
                         # Multi-task setting
                         policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep, task_id=self.task_id)
@@ -323,6 +338,24 @@ class MuZeroEvaluator(ISerialEvaluator):
                     pred_value_dict_with_env_id = {k: v['predicted_value'] for k, v in policy_output.items()}
                     timestep_dict_with_env_id = {k: v.get('timestep', -1) for k, v in policy_output.items()}
                     visit_entropy_dict_with_env_id = {k: v['visit_count_distribution_entropy'] for k, v in policy_output.items()}
+                    for env_id, env_output in policy_output.items():
+                        root_diagnostics = env_output.get('root_action_diagnostics', [])
+                        if not root_diagnostics:
+                            continue
+                        selected_action = int(np.asarray(env_output['action']).reshape(-1)[0])
+                        selected_terms = next(
+                            (
+                                terms for terms in root_diagnostics
+                                if int(terms.get('action', -1)) == selected_action
+                            ),
+                            None,
+                        )
+                        ensemble_eval_root_diagnostics.append(
+                            {
+                                'root': root_diagnostics,
+                                'selected': selected_terms,
+                            }
+                        )
 
                     # Remap outputs from policy's internal IDs to environment IDs.
                     actions, distributions_dict, value_dict, pred_value_dict, timestep_dict, visit_entropy_dict = {}, {}, {}, {}, {}, {}
@@ -377,17 +410,13 @@ class MuZeroEvaluator(ISerialEvaluator):
                             )
 
                             # If there are more episodes to run than available environments, reset and reuse this one.
-                            if n_episode > self._env_num:
+                            if n_episode > self._env_num and remain_episode > 0 and env_has_eval_quota(env_id):
                                 init_obs = self._env.ready_obs
-                                # Wait for the environment to be ready again.
-                                while len(init_obs.keys()) != self._env_num:
+                                # Wait for this environment to be ready again.
+                                while env_id not in init_obs:
                                     self._logger.info(f"Waiting for env {env_id} to reset. Current ready envs: {list(init_obs.keys())}")
                                     time.sleep(retry_waiting_time)
                                     init_obs = self._env.ready_obs
-
-                                new_available_env_id = set(init_obs.keys()).difference(ready_env_id)
-                                ready_env_id = ready_env_id.union(set(list(new_available_env_id)[:remain_episode]))
-                                remain_episode -= min(len(new_available_env_id), remain_episode)
 
                                 # Re-initialize state for the new episode.
                                 action_mask_dict[env_id] = to_ndarray(init_obs[env_id]['action_mask'])
@@ -430,6 +459,64 @@ class MuZeroEvaluator(ISerialEvaluator):
             episode_info = eval_monitor.get_episode_info()
             if episode_info is not None:
                 info.update(episode_info)
+            bounded_eval_roots = [
+                item for item in ensemble_eval_root_diagnostics
+                if item['root'] and float(item['root'][0].get('bounded_ensemble_mode', 0.0)) > 0.5
+            ]
+            if bounded_eval_roots:
+                bounded_eval_edges = [terms for item in bounded_eval_roots for terms in item['root']]
+                bounded_eval_selected = [item['selected'] for item in bounded_eval_roots if item['selected'] is not None]
+                info.update(
+                    {
+                        'bounded_ensemble_all_edge_cap_fraction': float(
+                            np.mean(
+                                [float(terms.get('ensemble_envelope_cap_applied', 0.0)) for terms in bounded_eval_edges]
+                            )
+                        ),
+                        'bounded_ensemble_selected_cap_fraction': float(
+                            np.mean(
+                                [
+                                    float(terms.get('ensemble_envelope_cap_applied', 0.0))
+                                    for terms in bounded_eval_selected
+                                ]
+                            )
+                        ) if bounded_eval_selected else 0.0,
+                        'bounded_ensemble_changed_mean_argmax_fraction': float(
+                            np.mean(
+                                [
+                                    float(item['root'][0].get('bounded_changed_mean_score_argmax', 0.0))
+                                    for item in bounded_eval_roots
+                                ]
+                            )
+                        ),
+                        'bounded_ensemble_same_member_all_actions_fraction': float(
+                            np.mean(
+                                [
+                                    float(item['root'][0].get('same_envelope_member_all_actions', 0.0))
+                                    for item in bounded_eval_roots
+                                ]
+                            )
+                        ),
+                        'bounded_ensemble_selected_envelope_gap_mean': float(
+                            np.mean(
+                                [
+                                    float(terms.get('ensemble_envelope_gap_from_mean', 0.0))
+                                    for terms in bounded_eval_selected
+                                ]
+                            )
+                        ) if bounded_eval_selected else 0.0,
+                    }
+                )
+                ensemble_size = int(self.policy_config.model.get('ensemble_size', 1))
+                for member_id in range(ensemble_size):
+                    info[f'bounded_ensemble_selected_winner_member_{member_id}_fraction'] = float(
+                        np.mean(
+                            [
+                                int(terms.get('ensemble_envelope_member_id', -1)) == member_id
+                                for terms in bounded_eval_selected
+                            ]
+                        )
+                    ) if bounded_eval_selected else 0.0
 
             logging.info(f'rank {self._rank}, self.task_id: {self.task_id}')
             self._logger.info(self._logger.get_tabulate_vars_hor(info))

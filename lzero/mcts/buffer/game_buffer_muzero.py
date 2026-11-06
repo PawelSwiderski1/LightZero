@@ -9,6 +9,7 @@ from lzero.mcts.tree_search.mcts_ptree import MuZeroMCTSPtree as MCTSPtree
 from lzero.mcts.utils import prepare_observation
 from lzero.policy import DiscreteSupport, to_detach_cpu_numpy, concat_output, concat_output_value, inverse_scalar_transform
 from .game_buffer import GameBuffer
+from .game_segment import should_bootstrap_at_trajectory_boundary
 
 if TYPE_CHECKING:
     from lzero.policy import MuZeroPolicy, EfficientZeroPolicy, SampledEfficientZeroPolicy
@@ -59,6 +60,9 @@ class MuZeroGameBuffer(GameBuffer):
         self.origin_search_time = 0
         self.sample_times = 0
         self.active_root_num = 0
+        self.current_train_iter = 0
+        self.current_envstep = 0
+        self.last_value_target_stats = {}
 
         if hasattr(self._cfg, 'task_id'):
             self.task_id = self._cfg.task_id
@@ -75,6 +79,14 @@ class MuZeroGameBuffer(GameBuffer):
         self.value_support = DiscreteSupport(*self._cfg.model.value_support_range)
         self.reward_support = DiscreteSupport(*self._cfg.model.reward_support_range)
 
+    def set_train_iter_env_step(self, train_iter: int, env_step: int) -> None:
+        """
+        Store learner progress so target construction can decide whether replay
+        samples are old enough for Search-Based Value Estimation.
+        """
+        self.current_train_iter = int(train_iter)
+        self.current_envstep = int(env_step)
+
     def _assign_target_policy_for_legal_actions(
             self, policy_tmp: List[float], policy: List[float], legal_actions: List[int]
     ) -> None:
@@ -86,6 +98,47 @@ class MuZeroGameBuffer(GameBuffer):
         """
         for index, legal_action in enumerate(legal_actions):
             policy_tmp[legal_action] = policy[index]
+
+    def _value_target_mode(self) -> str:
+        mode = str(getattr(self._cfg, 'value_target_mode', 'auto')).lower()
+        if mode == 'auto':
+            if getattr(self._cfg, 'use_root_value', False) or getattr(
+                    self._cfg, 'reanalyze_use_search_value_target', False
+            ):
+                return 'search_bootstrap'
+            return 'td'
+        if mode not in ['td', 'search_bootstrap', 'mixed_sve']:
+            raise ValueError(
+                "value_target_mode must be one of ['auto', 'td', 'search_bootstrap', 'mixed_sve'], "
+                f"got {mode!r}"
+            )
+        return mode
+
+    @staticmethod
+    def _coerce_transition_index(index: Any) -> Optional[int]:
+        if isinstance(index, (int, np.integer)):
+            return int(index)
+        if isinstance(index, str) and index.isdigit():
+            return int(index)
+        return None
+
+    def _transition_index_with_offset(self, index: Any, offset: int) -> Optional[int]:
+        base_index = self._coerce_transition_index(index)
+        if base_index is None:
+            return None
+        return base_index + int(offset)
+
+    def _use_sve_for_transition(self, transition_index: Optional[int], total_transitions: int) -> bool:
+        if self._value_target_mode() != 'mixed_sve':
+            return False
+        if int(self.current_train_iter) < int(getattr(self._cfg, 'sve_start_train_iter', 0)):
+            return False
+        if transition_index is None:
+            return False
+        recent_window = int(getattr(self._cfg, 'sve_recent_window', 0))
+        if recent_window > 0 and transition_index >= max(0, int(total_transitions) - recent_window):
+            return False
+        return True
 
     def reset_runtime_metrics(self):
         """
@@ -163,10 +216,56 @@ class MuZeroGameBuffer(GameBuffer):
         reward_value_context, policy_re_context, policy_non_re_context, current_batch = self._make_batch(
             batch_size, self._cfg.reanalyze_ratio
         )
+        return self._build_train_data_from_context(
+            reward_value_context, policy_re_context, policy_non_re_context, current_batch, policy
+        )
+
+    def sample_from_orig_data(
+            self,
+            orig_data: Tuple[Any],
+            policy: Union["MuZeroPolicy", "EfficientZeroPolicy", "SampledEfficientZeroPolicy"],
+    ) -> List[Any]:
+        """
+        Build a training batch from explicitly selected game segments/positions.
+
+        This is used by auxiliary samplers, such as elite-episode replay, that
+        choose roots outside the main replay buffer's PER distribution while
+        still reusing the standard MuZero target construction.
+        """
+        policy._target_model.to(self._cfg.device)
+        policy._target_model.eval()
+
+        reward_value_context, policy_re_context, policy_non_re_context, current_batch = self._make_batch_from_orig_data(
+            orig_data, self._cfg.reanalyze_ratio
+        )
+        return self._build_train_data_from_context(
+            reward_value_context, policy_re_context, policy_non_re_context, current_batch, policy
+        )
+
+    def _build_train_data_from_context(
+            self,
+            reward_value_context: List[Any],
+            policy_re_context: List[Any],
+            policy_non_re_context: List[Any],
+            current_batch: List[Any],
+            policy: Union["MuZeroPolicy", "EfficientZeroPolicy", "SampledEfficientZeroPolicy"],
+    ) -> List[Any]:
+        """
+        Convert prepared batch contexts into the train_data consumed by policy learning.
+        """
         # target reward, target value
-        batch_rewards, batch_target_values = self._compute_target_reward_value(
+        target_reward_value = self._compute_target_reward_value(
             reward_value_context, policy._target_model
         )
+        batch_member_target_values = None
+        if len(target_reward_value) == 2:
+            batch_rewards, batch_target_values = target_reward_value
+        elif len(target_reward_value) == 3:
+            batch_rewards, batch_target_values, batch_member_target_values = target_reward_value
+        else:
+            raise ValueError(
+                f"Unexpected reward/value target output length: {len(target_reward_value)}"
+            )
         with self._compute_target_timer:
             batch_target_policies_re = self._compute_target_policy_reanalyzed(policy_re_context, policy._target_model)
         self.compute_target_re_time += self._compute_target_timer.value
@@ -184,6 +283,8 @@ class MuZeroGameBuffer(GameBuffer):
             batch_target_policies = batch_target_policies_non_re
 
         target_batch = [batch_rewards, batch_target_values, batch_target_policies]
+        if batch_member_target_values is not None:
+            target_batch.append(batch_member_target_values)
 
         # a batch contains the current_batch and the target_batch
         train_data = [current_batch, target_batch]
@@ -208,16 +309,36 @@ class MuZeroGameBuffer(GameBuffer):
         """
         # obtain the batch context from replay buffer
         orig_data = self._sample_orig_data(batch_size)
+        return self._make_batch_from_orig_data(orig_data, reanalyze_ratio)
+
+    def _make_batch_from_orig_data(self, orig_data: Tuple[Any], reanalyze_ratio: float) -> Tuple[Any]:
+        """
+        Prepare contexts from explicit sampled roots.
+        """
         game_segment_list, pos_in_game_segment_list, batch_index_list, weights_list, make_time_list = orig_data
         batch_size = len(batch_index_list)
         obs_list, action_list, mask_list = [], [], []
+        intrinsic_reward_list = []
+        pure_exploration_episode_list = []
+        include_intrinsic_rewards = bool(getattr(self._cfg, 'store_selected_intrinsic_rewards', False))
+        include_pure_exploration_episode_flags = bool(
+            getattr(self._cfg, 'intrinsic_value_train_on_pure_exploration_only', False)
+        )
+        obs_unroll_steps = self._current_batch_obs_unroll_steps()
+        qstd_recompute_actions = bool(
+            getattr(self._cfg, 'intrinsic_reward_source', None) == 'qstd'
+            and getattr(self._cfg, 'qstd_exploration', False)
+            and getattr(self._cfg, 'qstd_recompute_replay_rewards', False)
+        )
+        action_unroll_steps = obs_unroll_steps if qstd_recompute_actions else self._cfg.num_unroll_steps
         # prepare the inputs of a batch
         for i in range(batch_size):
             game = game_segment_list[i]
             pos_in_game_segment = pos_in_game_segment_list[i]
 
-            actions_tmp = game.action_segment[pos_in_game_segment:pos_in_game_segment +
-                                              self._cfg.num_unroll_steps].tolist()
+            actions_tmp = game.action_segment[
+                pos_in_game_segment:pos_in_game_segment + action_unroll_steps
+            ].tolist()
 
             # add mask for invalid actions (out of trajectory), 1 for valid, 0 for invalid
             # mask_tmp = [1. for i in range(len(actions_tmp))]
@@ -225,21 +346,50 @@ class MuZeroGameBuffer(GameBuffer):
 
             # TODO: the child_visits after position <self._cfg.game_segment_length> in the segment (with padded part) may not be updated
             # So the corresponding position should not be used in the training
-            mask_tmp = [1. for i in range(min(len(actions_tmp), self._cfg.game_segment_length - pos_in_game_segment))]
-            mask_tmp += [0. for _ in range(self._cfg.num_unroll_steps + 1 - len(mask_tmp))]
+            base_mask_len = self._cfg.num_unroll_steps + 1
+            valid_base_steps = min(
+                len(actions_tmp),
+                self._cfg.num_unroll_steps,
+                max(0, self._cfg.game_segment_length - pos_in_game_segment),
+            )
+            mask_tmp = [1. for _ in range(valid_base_steps)]
+            mask_tmp += [0. for _ in range(base_mask_len - len(mask_tmp))]
+
+            if obs_unroll_steps > base_mask_len:
+                future_mask_len = obs_unroll_steps
+                valid_future_steps = min(
+                    future_mask_len,
+                    max(0, len(game.action_segment) - pos_in_game_segment),
+                )
+                future_mask = [1. for _ in range(valid_future_steps)]
+                future_mask += [0. for _ in range(future_mask_len - len(future_mask))]
+                mask_tmp += future_mask
 
             # pad random action
             actions_tmp += [
                 np.random.randint(0, game.action_space_size)
-                for _ in range(self._cfg.num_unroll_steps - len(actions_tmp))
+                for _ in range(action_unroll_steps - len(actions_tmp))
             ]
+            if include_intrinsic_rewards:
+                reward_steps = obs_unroll_steps
+                intrinsic_rewards_tmp = []
+                if hasattr(game, 'intrinsic_reward_segment'):
+                    intrinsic_rewards_tmp = list(
+                        game.intrinsic_reward_segment[pos_in_game_segment:pos_in_game_segment + reward_steps]
+                    )
+                intrinsic_rewards_tmp += [0.0 for _ in range(reward_steps - len(intrinsic_rewards_tmp))]
+                intrinsic_reward_list.append(intrinsic_rewards_tmp[:reward_steps])
+            if include_pure_exploration_episode_flags:
+                pure_exploration_episode_list.append(
+                    float(bool(getattr(game, 'pure_exploration_episode', False)))
+                )
 
             # obtain the input observations
             # pad if length of obs in game_segment is less than stack+num_unroll_steps
             # e.g. stack+num_unroll_steps = 4+5
             obs_list.append(
                 game_segment_list[i].get_unroll_obs(
-                    pos_in_game_segment_list[i], num_unroll_steps=self._cfg.num_unroll_steps, padding=True
+                    pos_in_game_segment_list[i], num_unroll_steps=obs_unroll_steps, padding=True
                 )
             )
             action_list.append(actions_tmp)
@@ -249,7 +399,12 @@ class MuZeroGameBuffer(GameBuffer):
         obs_list = prepare_observation(obs_list, self._cfg.model.model_type)
 
         # formalize the inputs of a batch
-        current_batch = [obs_list, action_list, mask_list, batch_index_list, weights_list, make_time_list]
+        current_batch = [obs_list, action_list, mask_list]
+        if include_intrinsic_rewards:
+            current_batch.append(intrinsic_reward_list)
+        if include_pure_exploration_episode_flags:
+            current_batch.append(pure_exploration_episode_list)
+        current_batch += [batch_index_list, weights_list, make_time_list]
         for i in range(len(current_batch)):
             current_batch[i] = np.asarray(current_batch[i])
 
@@ -288,6 +443,30 @@ class MuZeroGameBuffer(GameBuffer):
         context = reward_value_context, policy_re_context, policy_non_re_context, current_batch
         return context
 
+    def _current_batch_obs_unroll_steps(self) -> int:
+        obs_unroll_steps = int(self._cfg.num_unroll_steps)
+        if (
+                (
+                    getattr(self._cfg, 'rnd_exploration', False)
+                    and getattr(self._cfg, 'rnd_use_learned_intrinsic_model', True)
+                )
+                or (
+                    getattr(self._cfg, 'intrinsic_reward_source', None) == 'dynamics_disagreement'
+                    and getattr(self._cfg, 'dynamics_disagreement_train_intrinsic_value', False)
+                )
+                or (
+                    getattr(self._cfg, 'intrinsic_reward_source', None) == 'qstd'
+                    and getattr(self._cfg, 'qstd_exploration', False)
+                )
+                or getattr(self._cfg, 'intrinsic_reward_source', None) == 'state_value_disagreement'
+                or getattr(self._cfg, 'intrinsic_reward_source', None) == 'state_density'
+        ):
+            intrinsic_td_steps = getattr(self._cfg, 'rnd_intrinsic_td_steps', None)
+            if intrinsic_td_steps is None:
+                intrinsic_td_steps = getattr(self._cfg, 'td_steps', obs_unroll_steps)
+            obs_unroll_steps = obs_unroll_steps + max(1, int(intrinsic_td_steps))
+        return obs_unroll_steps
+
     def _prepare_reward_value_context(
             self, batch_index_list: List[str], game_segment_list: List[Any], pos_in_game_segment_list: List[Any],
             total_transitions: int
@@ -306,8 +485,13 @@ class MuZeroGameBuffer(GameBuffer):
         """
         zero_obs = game_segment_list[0].zero_obs()
         value_obs_list = []
+        current_obs_list = []
+        sve_obs_list = []
         # the value is valid or not (out of game_segment)
         value_mask = []
+        current_value_mask = []
+        sve_value_mask = []
+        transition_index_list = []
         rewards_list = []
         game_segment_lens = []
         # for board games
@@ -316,16 +500,13 @@ class MuZeroGameBuffer(GameBuffer):
         root_values = []
 
         td_steps_list = []
-        for game_segment, state_index in zip(game_segment_list, pos_in_game_segment_list):
+        sve_prefix_steps_list = []
+        sve_action_mask_list = []
+        sve_to_play_list = []
+        for batch_index, game_segment, state_index in zip(batch_index_list, game_segment_list, pos_in_game_segment_list):
             game_segment_len = len(game_segment)
             game_segment_lens.append(game_segment_len)
-            # original buffer td-steps
-            td_steps = np.clip(self._cfg.td_steps, 1, max(1, game_segment_len - state_index)).astype(np.int32)
-
-            # prepare the corresponding observations for bootstrapped values o_{t+k}
-            # o[t+ td_steps, t + td_steps + stack frames + num_unroll_steps]
-            # t=2+3 -> o[2+3, 2+3+4+5] -> o[5, 14]
-            game_obs = game_segment.get_unroll_obs(state_index + td_steps, self._cfg.num_unroll_steps)
+            current_game_obs = game_segment.get_unroll_obs(state_index, self._cfg.num_unroll_steps, padding=True)
 
             rewards_list.append(game_segment.reward_segment)
             
@@ -334,28 +515,85 @@ class MuZeroGameBuffer(GameBuffer):
             to_play_segment.append(game_segment.to_play_segment)
 
             truncation_length = game_segment_len
+            time_limit_truncated = bool(getattr(game_segment, 'time_limit_truncated', False))
+            bootstrap_at_time_limit = bool(getattr(self._cfg, 'bootstrap_at_time_limit', True))
 
             for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
-                # get the <num_unroll_steps+1>  bootstrapped target obs
-                td_steps_list.append(td_steps)
-                # index of bootstrapped obs o_{t+td_steps}
-                bootstrap_index = current_index + td_steps
+                offset = current_index - state_index
+                transition_index_list.append(self._transition_index_with_offset(batch_index, offset))
 
-                if bootstrap_index < truncation_length:
+                remaining_steps = max(0, truncation_length - current_index)
+                effective_td_steps = min(int(self._cfg.td_steps), remaining_steps) if remaining_steps > 0 else 0
+                td_steps_list.append(np.int32(effective_td_steps))
+                bootstrap_index = current_index + effective_td_steps
+
+                can_bootstrap = should_bootstrap_at_trajectory_boundary(
+                    bootstrap_index,
+                    truncation_length,
+                    time_limit_truncated,
+                    bootstrap_at_time_limit,
+                )
+                if remaining_steps > 0 and can_bootstrap:
                     value_mask.append(1)
-                    beg_index = current_index - state_index
-                    end_index = beg_index + self._cfg.model.frame_stack_num
-                    # the stacked obs in time t
-                    obs = game_obs[beg_index:end_index]
+                    obs = game_segment.get_unroll_obs(bootstrap_index, 0, padding=True)
                 else:
                     value_mask.append(0)
                     obs = zero_obs
 
                 value_obs_list.append(obs)
 
+                if current_index < truncation_length:
+                    current_value_mask.append(1)
+                    beg_index = offset
+                    end_index = beg_index + self._cfg.model.frame_stack_num
+                    current_obs = current_game_obs[beg_index:end_index]
+                else:
+                    current_value_mask.append(0)
+                    current_obs = zero_obs
+
+                current_obs_list.append(current_obs)
+
+                requested_sve_prefix = max(
+                    0, int(getattr(self._cfg, 'sve_real_reward_prefix_steps', 0))
+                )
+                effective_sve_prefix = min(requested_sve_prefix, remaining_steps)
+                sve_prefix_steps_list.append(np.int32(effective_sve_prefix))
+                sve_bootstrap_index = current_index + effective_sve_prefix
+                can_sve_bootstrap = remaining_steps > 0 and should_bootstrap_at_trajectory_boundary(
+                    sve_bootstrap_index,
+                    truncation_length,
+                    time_limit_truncated,
+                    bootstrap_at_time_limit,
+                )
+                if can_sve_bootstrap:
+                    sve_value_mask.append(1)
+                    sve_obs = game_segment.get_unroll_obs(sve_bootstrap_index, 0, padding=True)
+                else:
+                    sve_value_mask.append(0)
+                    sve_obs = zero_obs
+                sve_obs_list.append(sve_obs)
+
+                metadata_length = len(game_segment.to_play_segment)
+                if self._cfg.model.continuous_action_space is not True:
+                    metadata_length = min(
+                        metadata_length, len(game_segment.action_mask_segment)
+                    )
+                if sve_bootstrap_index < metadata_length:
+                    sve_to_play_list.append(game_segment.to_play_segment[sve_bootstrap_index])
+                    if self._cfg.model.continuous_action_space is not True:
+                        sve_action_mask_list.append(game_segment.action_mask_segment[sve_bootstrap_index])
+                else:
+                    sve_to_play_list.append(-1)
+                    if self._cfg.model.continuous_action_space is not True:
+                        sve_action_mask_list.append(
+                            np.ones(self._cfg.model.action_space_size, dtype=np.int8)
+                        )
+
         reward_value_context = [
             value_obs_list, value_mask, pos_in_game_segment_list, rewards_list, root_values, game_segment_lens, td_steps_list,
-            action_mask_segment, to_play_segment
+            action_mask_segment, to_play_segment, current_obs_list, current_value_mask, transition_index_list,
+            total_transitions, sve_obs_list, sve_value_mask, sve_prefix_steps_list, sve_action_mask_list,
+            sve_to_play_list
         ]
         return reward_value_context
 
@@ -464,7 +702,190 @@ class MuZeroGameBuffer(GameBuffer):
         # Return the float value of the reward.
         return float(r)
 
-    def _compute_target_reward_value(self, reward_value_context: List[Any], model: Any) -> Tuple[Any, Any]:
+    def _use_search_value_target(self) -> bool:
+        """
+        Use MCTS searched values as the bootstrap term in normal MuZero value targets.
+
+        ``use_root_value`` is the existing LightZero/EfficientZero knob.  The
+        more explicit ``reanalyze_use_search_value_target`` is kept separate so
+        experiment runners can enable this MuZero-specific comparison without
+        changing older configs.
+
+        In ``mixed_sve`` mode, normal/recent samples should stay anchored to
+        real-reward TD targets with a raw network bootstrap.  Stale samples get
+        MCTS search values through the explicit SVE override path instead.
+        """
+        mode = self._value_target_mode()
+        if mode == 'search_bootstrap':
+            return True
+        return False
+
+    def _search_values_from_network_output(
+            self,
+            network_output: List[Any],
+            transition_batch_size: int,
+            legal_actions: List[Any],
+            to_play: List[int],
+            model: Any,
+            member_id: Optional[int] = None,
+            add_root_noise: Optional[bool] = None,
+    ) -> np.ndarray:
+        _, reward_pool, policy_logits_pool, latent_state_roots = concat_output(network_output, data_type='muzero')
+        reward_pool = np.asarray(reward_pool).reshape(-1).tolist()
+        policy_logits_pool = np.asarray(policy_logits_pool).tolist()
+        if add_root_noise is None:
+            add_root_noise = bool(self._cfg.reanalyze_noise)
+        noises = None
+        if add_root_noise:
+            noises = [
+                np.random.dirichlet([self._cfg.root_dirichlet_alpha] * self.action_space_size
+                                    ).astype(np.float32).tolist() for _ in range(transition_batch_size)
+            ]
+        active_member_state = getattr(model, 'active_member_id', None)
+        if member_id is not None and hasattr(model, 'set_active_member'):
+            model.set_active_member(member_id)
+        try:
+            if self._cfg.mcts_ctree:
+                roots = MCTSCtree.roots(transition_batch_size, legal_actions)
+                if add_root_noise:
+                    roots.prepare(self._cfg.root_noise_weight, noises, reward_pool, policy_logits_pool, to_play)
+                else:
+                    roots.prepare_no_noise(reward_pool, policy_logits_pool, to_play)
+                with self._origin_search_timer:
+                    if self.task_id is not None:
+                        MCTSCtree(self._cfg).search(roots, model, latent_state_roots, to_play, task_id=self.task_id)
+                    else:
+                        MCTSCtree(self._cfg).search(roots, model, latent_state_roots, to_play)
+                self.origin_search_time += self._origin_search_timer.value
+            else:
+                roots = MCTSPtree.roots(transition_batch_size, legal_actions)
+                if add_root_noise:
+                    roots.prepare(self._cfg.root_noise_weight, noises, reward_pool, policy_logits_pool, to_play)
+                else:
+                    roots.prepare_no_noise(reward_pool, policy_logits_pool, to_play)
+                with self._origin_search_timer:
+                    if self.task_id is not None:
+                        MCTSPtree(self._cfg).search(roots, model, latent_state_roots, to_play, task_id=self.task_id)
+                    else:
+                        MCTSPtree(self._cfg).search(roots, model, latent_state_roots, to_play)
+                self.origin_search_time += self._origin_search_timer.value
+        finally:
+            if member_id is not None and active_member_state is not None:
+                if isinstance(active_member_state, list) and hasattr(model, 'set_active_members'):
+                    model.set_active_members(active_member_state)
+                elif hasattr(model, 'set_active_member'):
+                    model.set_active_member(int(active_member_state))
+        return np.asarray(roots.get_values())
+
+    def _infer_initial_outputs(self, obs_list: List[Any], model: Any, member_id: Optional[int] = None) -> List[Any]:
+        obs_array = prepare_observation(obs_list, self._cfg.model.model_type)
+        transition_batch_size = len(obs_array)
+        network_output = []
+        slices = int(np.ceil(transition_batch_size / self._cfg.mini_infer_size))
+        for i in range(slices):
+            beg_index = self._cfg.mini_infer_size * i
+            end_index = self._cfg.mini_infer_size * (i + 1)
+            m_obs = torch.from_numpy(obs_array[beg_index:end_index]).to(self._cfg.device)
+            if member_id is not None and self.task_id is not None:
+                m_output = model.initial_inference(m_obs, task_id=self.task_id, member_id=member_id)
+            elif member_id is not None:
+                m_output = model.initial_inference(m_obs, member_id=member_id)
+            elif self.task_id is not None:
+                m_output = model.initial_inference(m_obs, task_id=self.task_id)
+            else:
+                m_output = model.initial_inference(m_obs)
+            [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
+                [
+                    m_output.latent_state,
+                    inverse_scalar_transform(m_output.value, self.value_support),
+                    m_output.policy_logits
+                ]
+            )
+            network_output.append(m_output)
+        return network_output
+
+    def _ensemble_member_bootstrap_size(self) -> int:
+        if not bool(getattr(self._cfg, 'ensemble_member_bootstrap_targets', False)):
+            return 1
+        model_cfg = getattr(self._cfg, 'model', {})
+        return max(1, int(getattr(model_cfg, 'ensemble_size', 1)))
+
+    def _discount_bootstrap_values(
+            self,
+            values: Any,
+            value_mask: List[Any],
+            td_steps_list: List[Any],
+            transition_batch_size: int,
+            to_play_segment: List[Any],
+    ) -> np.ndarray:
+        value_array = np.asarray(values).reshape(-1)
+        if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
+            value_array = value_array * np.array(
+                [
+                    self._cfg.discount_factor ** td_steps_list[i]
+                    if int(td_steps_list[i]) % 2 == 0
+                    else -self._cfg.discount_factor ** td_steps_list[i]
+                    for i in range(transition_batch_size)
+                ]
+            )
+        else:
+            value_array = value_array * (
+                np.array([self._cfg.discount_factor for _ in range(transition_batch_size)]) ** td_steps_list
+            )
+        return value_array * np.array(value_mask)
+
+    def _bootstrap_value_array_for_member(
+            self,
+            obs_list: List[Any],
+            model: Any,
+            value_mask: List[Any],
+            td_steps_list: List[Any],
+            transition_batch_size: int,
+            to_play_segment: List[Any],
+            use_search_value_target: bool,
+            legal_actions: Optional[List[Any]] = None,
+            to_play: Optional[List[int]] = None,
+            member_id: Optional[int] = None,
+    ) -> np.ndarray:
+        network_output = self._infer_initial_outputs(obs_list, model, member_id=member_id)
+        if use_search_value_target:
+            value_list = self._search_values_from_network_output(
+                network_output, transition_batch_size, legal_actions, to_play, model, member_id=member_id
+            )
+        else:
+            value_list = concat_output_value(network_output)
+        return self._discount_bootstrap_values(
+            value_list, value_mask, td_steps_list, transition_batch_size, to_play_segment
+        )
+
+    def _member_search_value_overrides(
+            self,
+            obs_list: List[Any],
+            flat_indices: List[int],
+            legal_actions: List[Any],
+            to_play: List[int],
+            model: Any,
+            ensemble_member_bootstrap_size: int,
+    ) -> List[dict]:
+        member_overrides = [{} for _ in range(ensemble_member_bootstrap_size)]
+        for member_id in range(ensemble_member_bootstrap_size):
+            search_network_output = self._infer_initial_outputs(obs_list, model, member_id=member_id)
+            search_values = self._search_values_from_network_output(
+                search_network_output,
+                len(flat_indices),
+                legal_actions,
+                to_play,
+                model,
+                member_id=member_id,
+                add_root_noise=bool(getattr(self._cfg, 'sve_search_noise', False)),
+            )
+            member_overrides[member_id] = {
+                flat_index: float(value)
+                for flat_index, value in zip(flat_indices, np.asarray(search_values).reshape(-1))
+            }
+        return member_overrides
+
+    def _compute_target_reward_value(self, reward_value_context: List[Any], model: Any) -> Tuple[Any, ...]:
         """
         Overview:
             prepare reward and value targets from the context of rewards and values.
@@ -476,71 +897,139 @@ class MuZeroGameBuffer(GameBuffer):
             - batch_target_values (:obj:'np.ndarray): batch of value estimation
         """
         value_obs_list, value_mask, pos_in_game_segment_list, rewards_list, root_values, game_segment_lens, td_steps_list, action_mask_segment, \
-        to_play_segment = reward_value_context  # noqa
+        to_play_segment, current_obs_list, current_value_mask, transition_index_list, total_transitions, sve_obs_list, \
+        sve_value_mask, sve_prefix_steps_list, sve_action_mask_list, sve_to_play_list = reward_value_context  # noqa
         # transition_batch_size = game_segment_batch_size * (num_unroll_steps+1)
         transition_batch_size = len(value_obs_list)
+        use_search_value_target = self._use_search_value_target()
+        use_mixed_sve = self._value_target_mode() == 'mixed_sve'
+        if use_search_value_target:
+            game_segment_batch_size = len(pos_in_game_segment_list)
+            to_play, action_mask = self._preprocess_to_play_and_action_mask(
+                game_segment_batch_size, to_play_segment, action_mask_segment, pos_in_game_segment_list
+            )
+            if self._cfg.model.continuous_action_space is True:
+                action_mask = [
+                    list(np.ones(self._cfg.model.num_of_sampled_actions, dtype=np.int8))
+                    for _ in range(transition_batch_size)
+                ]
+                legal_actions = [
+                    [-1 for _ in range(self._cfg.model.num_of_sampled_actions)]
+                    for _ in range(transition_batch_size)
+                ]
+            else:
+                legal_actions = [np.nonzero(action_mask[j])[0].tolist() for j in range(transition_batch_size)]
 
         batch_target_values, batch_rewards = [], []
         with torch.no_grad():
-            value_obs_list = prepare_observation(value_obs_list, self._cfg.model.model_type)
+            ensemble_member_bootstrap_size = self._ensemble_member_bootstrap_size()
+            member_value_array = None
+            if ensemble_member_bootstrap_size > 1:
+                member_value_array = np.stack(
+                    [
+                        self._bootstrap_value_array_for_member(
+                            value_obs_list,
+                            model,
+                            value_mask,
+                            td_steps_list,
+                            transition_batch_size,
+                            to_play_segment,
+                            use_search_value_target,
+                            legal_actions if use_search_value_target else None,
+                            to_play if use_search_value_target else None,
+                            member_id,
+                        )
+                        for member_id in range(ensemble_member_bootstrap_size)
+                    ],
+                    axis=0,
+                )
+                value_array = member_value_array[0].copy()
+            else:
+                value_array = self._bootstrap_value_array_for_member(
+                    value_obs_list,
+                    model,
+                    value_mask,
+                    td_steps_list,
+                    transition_batch_size,
+                    to_play_segment,
+                    use_search_value_target,
+                    legal_actions if use_search_value_target else None,
+                    to_play if use_search_value_target else None,
+                    None,
+                )
 
-            # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
-            slices = int(np.ceil(transition_batch_size / self._cfg.mini_infer_size))
-            network_output = []
-            for i in range(slices):
-                beg_index = self._cfg.mini_infer_size * i
-                end_index = self._cfg.mini_infer_size * (i + 1)
-                m_obs = torch.from_numpy(value_obs_list[beg_index:end_index]).to(self._cfg.device)
-                # calculate the target value
-                if self.task_id is not None:
-                    m_output = model.initial_inference(m_obs, task_id=self.task_id)
+            sve_value_overrides = {}
+            member_sve_value_overrides = None
+            if use_mixed_sve:
+                if self._cfg.model.continuous_action_space is True:
+                    sve_legal_actions = [
+                        [-1 for _ in range(self._cfg.model.num_of_sampled_actions)]
+                        for _ in range(transition_batch_size)
+                    ]
                 else:
-                    m_output = model.initial_inference(m_obs)
-                
-
-                # if not in training, obtain the scalars of the value/reward
-                [m_output.latent_state, m_output.value, m_output.policy_logits] = to_detach_cpu_numpy(
-                    [
-                        m_output.latent_state,
-                        inverse_scalar_transform(m_output.value, self.value_support),
-                        m_output.policy_logits
+                    sve_legal_actions = [
+                        np.nonzero(sve_action_mask_list[j])[0].tolist()
+                        for j in range(transition_batch_size)
                     ]
-                )
 
-                network_output.append(m_output)
+                sve_indices = [
+                    index for index, (is_valid, transition_index) in enumerate(
+                        zip(sve_value_mask, transition_index_list)
+                    )
+                    if bool(is_valid) and self._use_sve_for_transition(transition_index, total_transitions)
+                ]
+                if len(sve_indices) > 0:
+                    sve_search_obs_list = [sve_obs_list[index] for index in sve_indices]
+                    sve_legal_actions_subset = [sve_legal_actions[index] for index in sve_indices]
+                    sve_to_play_subset = [sve_to_play_list[index] for index in sve_indices]
+                    if ensemble_member_bootstrap_size > 1:
+                        member_sve_value_overrides = self._member_search_value_overrides(
+                            sve_search_obs_list,
+                            sve_indices,
+                            sve_legal_actions_subset,
+                            sve_to_play_subset,
+                            model,
+                            ensemble_member_bootstrap_size,
+                        )
+                        sve_value_overrides = member_sve_value_overrides[0]
+                    else:
+                        member_sve_value_overrides = self._member_search_value_overrides(
+                            sve_search_obs_list,
+                            sve_indices,
+                            sve_legal_actions_subset,
+                            sve_to_play_subset,
+                            model,
+                            1,
+                        )
+                        sve_value_overrides = member_sve_value_overrides[0]
 
-            # concat the output slices after model inference
-            if self._cfg.use_root_value:
-                value_list = np.array(root_values) # TODO
-            else:
-                # use the predicted values
-                value_list = concat_output_value(network_output)
-
-            # get last state value
-            if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
-                # TODO(pu): for board_games, very important, to check
-                value_list = value_list.reshape(-1) * np.array(
-                    [
-                        self._cfg.discount_factor ** td_steps_list[i] if int(td_steps_list[i]) %
-                        2 == 0 else -self._cfg.discount_factor ** td_steps_list[i]
-                        for i in range(transition_batch_size)
-                    ]
-                )
-            else:
-                value_list = value_list.reshape(-1) * (
-                    np.array([self._cfg.discount_factor for _ in range(transition_batch_size)]) ** td_steps_list
-                )
-            # if len(value_mask)>sum(value_mask):
-            #     print('have value mask')
-            value_list = value_list * np.array(value_mask)
-            value_list = value_list.tolist()
+            value_list = value_array.tolist()
+            batch_member_target_values = (
+                [[] for _ in range(ensemble_member_bootstrap_size)]
+                if member_value_array is not None
+                else None
+            )
             value_index = 0
+            final_target_values_for_stats = []
+            td_target_values_for_stats = []
+            sve_final_target_values_for_stats = []
+            sve_td_target_values_for_stats = []
+            td_final_target_values_for_stats = []
+            sve_prefix_steps_for_stats = []
+            sve_prefix_returns_for_stats = []
+            sve_search_values_for_stats = []
+            sve_search_contributions_for_stats = []
 
             for game_segment_len_non_re, reward_list, state_index, to_play_list in zip(game_segment_lens, rewards_list,
                                                                                        pos_in_game_segment_list,
                                                                                        to_play_segment):
                 target_values = []
                 target_rewards = []
+                member_target_values = (
+                    [[] for _ in range(ensemble_member_bootstrap_size)]
+                    if member_value_array is not None
+                    else None
+                )
                 base_index = state_index
 
                 truncation_length = game_segment_len_non_re
@@ -552,13 +1041,72 @@ class MuZeroGameBuffer(GameBuffer):
                             # TODO(pu): for board_games, very important, to check
                             if to_play_list[base_index] == to_play_list[i]:
                                 value_list[value_index] += reward * self._cfg.discount_factor ** i
+                                if member_value_array is not None:
+                                    member_value_array[:, value_index] += reward * self._cfg.discount_factor ** i
                             else:
                                 value_list[value_index] += -reward * self._cfg.discount_factor ** i
+                                if member_value_array is not None:
+                                    member_value_array[:, value_index] += -reward * self._cfg.discount_factor ** i
                         else:
                             value_list[value_index] += reward * self._cfg.discount_factor ** i
+                            if member_value_array is not None:
+                                member_value_array[:, value_index] += reward * self._cfg.discount_factor ** i
 
                     # TODO: check the boundary condition
-                    target_values.append(self._scalar_reward(value_list[value_index]))
+                    td_target_value = self._scalar_reward(value_list[value_index])
+                    if value_index in sve_value_overrides:
+                        sve_prefix_steps = int(sve_prefix_steps_list[value_index])
+                        sve_prefix_return = 0.0
+                        for i, reward in enumerate(
+                                reward_list[current_index:current_index + sve_prefix_steps]
+                        ):
+                            scalar_reward = self._scalar_reward(reward)
+                            if self._cfg.env_type == 'board_games' and to_play_segment[0][0] in [1, 2]:
+                                if to_play_list[base_index] == to_play_list[i]:
+                                    sve_prefix_return += scalar_reward * self._cfg.discount_factor ** i
+                                else:
+                                    sve_prefix_return += -scalar_reward * self._cfg.discount_factor ** i
+                            else:
+                                sve_prefix_return += scalar_reward * self._cfg.discount_factor ** i
+
+                        sve_search_value = self._scalar_reward(sve_value_overrides[value_index])
+                        sve_search_discount = self._cfg.discount_factor ** sve_prefix_steps
+                        if (
+                                self._cfg.env_type == 'board_games'
+                                and to_play_segment[0][0] in [1, 2]
+                                and sve_prefix_steps % 2 != 0
+                        ):
+                            sve_search_discount = -sve_search_discount
+                        sve_search_contribution = sve_search_discount * sve_search_value
+                        target_value = sve_prefix_return + sve_search_contribution
+                    else:
+                        target_value = value_list[value_index]
+                    final_target_value = self._scalar_reward(target_value)
+                    target_values.append(final_target_value)
+                    td_target_values_for_stats.append(td_target_value)
+                    final_target_values_for_stats.append(final_target_value)
+                    if value_index in sve_value_overrides:
+                        sve_final_target_values_for_stats.append(final_target_value)
+                        sve_td_target_values_for_stats.append(td_target_value)
+                        sve_prefix_steps_for_stats.append(float(sve_prefix_steps))
+                        sve_prefix_returns_for_stats.append(float(sve_prefix_return))
+                        sve_search_values_for_stats.append(float(sve_search_value))
+                        sve_search_contributions_for_stats.append(float(sve_search_contribution))
+                    else:
+                        td_final_target_values_for_stats.append(final_target_value)
+                    if member_value_array is not None:
+                        for member_id in range(ensemble_member_bootstrap_size):
+                            member_override = (
+                                member_sve_value_overrides[member_id]
+                                if member_sve_value_overrides is not None
+                                else {}
+                            )
+                            if value_index in member_override:
+                                member_search_value = self._scalar_reward(member_override[value_index])
+                                member_target_value = sve_prefix_return + sve_search_discount * member_search_value
+                            else:
+                                member_target_value = member_value_array[member_id, value_index]
+                            member_target_values[member_id].append(self._scalar_reward(member_target_value))
                     if current_index < len(reward_list):
                         target_rewards.append(self._scalar_reward(reward_list[current_index]))
                     else:
@@ -568,9 +1116,42 @@ class MuZeroGameBuffer(GameBuffer):
 
                 batch_rewards.append(target_rewards)
                 batch_target_values.append(target_values)
+                if batch_member_target_values is not None:
+                    for member_id in range(ensemble_member_bootstrap_size):
+                        batch_member_target_values[member_id].append(member_target_values[member_id])
 
         batch_rewards = np.asarray(batch_rewards)
         batch_target_values = np.asarray(batch_target_values)
+        target_count = len(final_target_values_for_stats)
+        sve_count = len(sve_final_target_values_for_stats)
+
+        def _safe_mean(values: List[float]) -> float:
+            return float(np.mean(values)) if len(values) > 0 else 0.0
+
+        self.last_value_target_stats = {
+            'value_target/count': float(target_count),
+            'value_target/sve_count': float(sve_count),
+            'value_target/sve_fraction': float(sve_count / target_count) if target_count > 0 else 0.0,
+            'value_target/td_fraction': float(1.0 - sve_count / target_count) if target_count > 0 else 0.0,
+            'value_target/final_mean': _safe_mean(final_target_values_for_stats),
+            'value_target/td_candidate_mean': _safe_mean(td_target_values_for_stats),
+            'value_target/td_final_mean': _safe_mean(td_final_target_values_for_stats),
+            'value_target/sve_final_mean': _safe_mean(sve_final_target_values_for_stats),
+            'value_target/sve_td_candidate_mean': _safe_mean(sve_td_target_values_for_stats),
+            'value_target/sve_prefix_steps_mean': _safe_mean(sve_prefix_steps_for_stats),
+            'value_target/sve_prefix_return_mean': _safe_mean(sve_prefix_returns_for_stats),
+            'value_target/sve_search_value_mean': _safe_mean(sve_search_values_for_stats),
+            'value_target/sve_search_contribution_mean': _safe_mean(sve_search_contributions_for_stats),
+            'value_target/bootstrap_mask_fraction': float(np.mean(value_mask)) if len(value_mask) > 0 else 0.0,
+            'value_target/bootstrap_at_time_limit': float(
+                bool(getattr(self._cfg, 'bootstrap_at_time_limit', True))
+            ),
+            'value_target/current_train_iter': float(self.current_train_iter),
+            'value_target/current_envstep': float(self.current_envstep),
+            'value_target/replay_transitions': float(total_transitions),
+        }
+        if batch_member_target_values is not None:
+            return batch_rewards, batch_target_values, np.asarray(batch_member_target_values)
 
         return batch_rewards, batch_target_values
 
@@ -677,7 +1258,9 @@ class MuZeroGameBuffer(GameBuffer):
             roots_values = roots.get_values()
             policy_index = 0
             # NOTE: It is very important to use the latest MCTS visit count distribution.
-            for state_index, child_visit, game_index in zip(pos_in_game_segment_list, child_visits, batch_index_list):
+            for state_index, child_visit, root_value, game_index in zip(
+                    pos_in_game_segment_list, child_visits, root_values, batch_index_list
+            ):
                 target_policies = []
 
                 for current_index in range(state_index, state_index + self._cfg.num_unroll_steps + 1):
@@ -704,7 +1287,7 @@ class MuZeroGameBuffer(GameBuffer):
                             # we replace the data at the corresponding location with the latest search results to keep the most up-to-date targets
                             sim_num = sum(distributions)
                             child_visit[current_index] = [visit_count/sim_num for visit_count in distributions]
-                            # root_values[current_index] = searched_value # TODO
+                            root_value[current_index] = searched_value
                             if self._cfg.action_type == 'fixed_action_space':
                                 # for atari/classic_control/box2d environments that only have one player.
                                 sum_visits = sum(distributions)
